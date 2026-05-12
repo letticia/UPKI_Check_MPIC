@@ -1,0 +1,313 @@
+#!/bin/bash
+#
+# This software is released under the MIT License.
+# https://opensource.org/licenses/MIT
+#
+
+if [ -z "$1" ]; then
+    echo "使用法: $0 <FQDN>"
+    exit 1
+fi
+
+TARGET_FQDN=$1
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PSL_FILE="$SCRIPT_DIR/public_suffix_list.dat"
+
+# Download PSL if not exists
+if [ ! -f "$PSL_FILE" ]; then
+    echo "Public Suffix List ($PSL_FILE) が見つかりません。ダウンロードします..."
+    curl -sS https://publicsuffix.org/list/public_suffix_list.dat -o "$PSL_FILE"
+    if [ $? -ne 0 ] || [ ! -s "$PSL_FILE" ]; then
+        echo "Public Suffix List のダウンロードに失敗しました。"
+        exit 1
+    fi
+fi
+
+# eTLD+1を判定する関数
+get_etld_plus_one() {
+    local domain=$1
+    local psl=$2
+    local parts
+    IFS='.' read -ra parts <<< "$domain"
+    
+    for (( i=0; i<${#parts[@]}; i++ )); do
+        local suffix=""
+        for (( j=i; j<${#parts[@]}; j++ )); do
+            if [ -n "$suffix" ]; then
+                suffix="$suffix.${parts[j]}"
+            else
+                suffix="${parts[j]}"
+            fi
+        done
+        
+        # 1. 例外ルール（!）の確認
+        if grep -Fxq "!$suffix" "$psl"; then
+            echo "$suffix"
+            return
+        fi
+
+        # 2. 完全一致の確認
+        if grep -Fxq "$suffix" "$psl"; then
+            if [ $i -gt 0 ]; then
+                local etld1=""
+                for (( j=i-1; j<${#parts[@]}; j++ )); do
+                    if [ -n "$etld1" ]; then
+                        etld1="$etld1.${parts[j]}"
+                    else
+                        etld1="${parts[j]}"
+                    fi
+                done
+                echo "$etld1"
+                return
+            else
+                echo "$suffix"
+                return
+            fi
+        fi
+
+        # 3. ワイルドカードの確認 (*.parent)
+        if [[ "$suffix" == *"."* ]]; then
+            local parent=${suffix#*.}
+            if grep -Fxq "*.$parent" "$psl"; then
+                if [ $i -gt 0 ]; then
+                    local etld1=""
+                    for (( j=i-1; j<${#parts[@]}; j++ )); do
+                        if [ -n "$etld1" ]; then
+                            etld1="$etld1.${parts[j]}"
+                        else
+                            etld1="${parts[j]}"
+                        fi
+                    done
+                    echo "$etld1"
+                    return
+                else
+                    echo "$suffix"
+                    return
+                fi
+            fi
+        fi
+    done
+    
+    # マッチしない場合のフォールバック（TLD+1）
+    if [ ${#parts[@]} -ge 2 ]; then
+        echo "${parts[${#parts[@]}-2]}.${parts[${#parts[@]}-1]}"
+    else
+        echo "$domain"
+    fi
+}
+
+# FQDNの確認処理本体
+process_fqdn() {
+    local fqdn=$1
+    local dns=$2
+    local dns_opt=""
+    
+    if [ -n "$dns" ]; then
+        dns_opt="@$dns"
+        echo "=== [$fqdn] をDNSサーバ $dns で確認 ==="
+    else
+        echo "=== [$fqdn] の確認 ==="
+    fi
+
+    # 名前解決できるか確認
+    local code=$(dig "$fqdn" $dns_opt +noall +comments | grep -ioE "status: [A-Z]+" | awk '{print $2}' | tr '[:lower:]' '[:upper:]')
+    if [[ "$code" == "NXDOMAIN" || "$code" == "SERVFAIL" ]]; then
+        echo "名前解決ができません。DNSの設定を修正しないと証明書発行が抑制されます。また、エラー338の原因になる可能性があります。"
+        return 1
+    fi
+
+    local current_fqdn=$fqdn
+    local is_cname_target=0
+    local visited_fqdns=("$current_fqdn")
+
+    while true; do
+        # CAAの確認
+        local caa_result=$(dig +short CAA "$current_fqdn" $dns_opt)
+        if [ -n "$caa_result" ]; then
+            if [ $is_cname_target -eq 1 ]; then
+                echo "CNAME先のCAAレコード ($current_fqdn):"
+                echo "$caa_result"
+            else
+                echo "CAAレコード ($current_fqdn):"
+                echo "$caa_result"
+            fi
+            
+            if ! echo "$caa_result" | grep -iq "secomtrust\.net"; then
+                echo "CAAレコードが存在しますが、 secomtrust.net が含まれません。発行が抑制され、エラー338の原因になる可能性があります。"
+            fi
+        else
+            if [ $is_cname_target -eq 1 ]; then
+                echo "CNAMEレコードの先のCAAレコードがありません ($current_fqdn)"
+            else
+                echo "CAAレコードがありません ($current_fqdn)"
+            fi
+        fi
+
+        # CNAMEの確認
+        local cname_result=$(dig +short CNAME "$current_fqdn" $dns_opt)
+        if [ -n "$cname_result" ]; then
+            local next_fqdn=$(echo "$cname_result" | head -n 1 | sed 's/\.$//')
+            echo "CNAMEレコード ($current_fqdn):"
+            echo "$cname_result"
+            
+            # CNAMEループ検知
+            for visited in "${visited_fqdns[@]}"; do
+                if [ "$visited" == "$next_fqdn" ]; then
+                    echo "CNAMEのループまたは重複を検知しました ($next_fqdn)。追跡を終了します。"
+                    break 2
+                fi
+            done
+            
+            current_fqdn=$next_fqdn
+            visited_fqdns+=("$current_fqdn")
+            is_cname_target=1
+            echo "--> CNAMEの先 ($current_fqdn) を確認します"
+            echo ""
+        else
+            echo "CNAMEレコードがありません ($current_fqdn)"
+            break
+        fi
+    done
+}
+
+# DNS情報を取得して変数に格納するヘルパー関数
+get_dns_info() {
+    local fqdn=$1
+    local dns=$2
+    local dns_opt=""
+    
+    if [ -n "$dns" ]; then
+        dns_opt="@$dns"
+    fi
+
+    # タイムアウトを防ぐために +time=3 +tries=2 を付与
+    local status=$(dig "$fqdn" $dns_opt +time=3 +tries=2 +noall +comments | grep -ioE "status: [A-Z]+" | awk '{print $2}' | tr '[:lower:]' '[:upper:]')
+    local caa=$(dig +short CAA "$fqdn" $dns_opt +time=3 +tries=2 | sort | tr '\n' ',' | sed 's/,$//')
+    local cname=$(dig +short CNAME "$fqdn" $dns_opt +time=3 +tries=2 | sort | tr '\n' ',' | sed 's/,$//')
+
+    if [ -z "$status" ]; then
+        status="TIMEOUT_OR_ERROR"
+    fi
+
+    echo "$status|$caa|$cname"
+}
+
+# MPIC判定を行う関数
+evaluate_mpic() {
+    local fqdn=$1
+    echo ""
+    echo "=================================================="
+    echo "【MPIC判定結果】 (Multi-Perspective Issuance Corroboration)"
+    echo "=================================================="
+    
+    # それぞれのDNSで情報を取得
+    local res_def=$(get_dns_info "$fqdn" "")
+    local stat_def=$(echo "$res_def" | cut -d'|' -f1)
+    local caa_def=$(echo "$res_def" | cut -d'|' -f2)
+    local cname_def=$(echo "$res_def" | cut -d'|' -f3)
+
+    local res_8888=$(get_dns_info "$fqdn" "8.8.8.8")
+    local stat_8888=$(echo "$res_8888" | cut -d'|' -f1)
+    local caa_8888=$(echo "$res_8888" | cut -d'|' -f2)
+    local cname_8888=$(echo "$res_8888" | cut -d'|' -f3)
+
+    local res_1111=$(get_dns_info "$fqdn" "1.1.1.1")
+    local stat_1111=$(echo "$res_1111" | cut -d'|' -f1)
+    local caa_1111=$(echo "$res_1111" | cut -d'|' -f2)
+    local cname_1111=$(echo "$res_1111" | cut -d'|' -f3)
+
+    local mpic_pass=1
+    local fail_reasons=()
+
+    # 1. パブリックDNSでの名前解決失敗
+    if [[ "$stat_8888" == "SERVFAIL" || "$stat_8888" == "TIMEOUT_OR_ERROR" || "$stat_1111" == "SERVFAIL" || "$stat_1111" == "TIMEOUT_OR_ERROR" ]]; then
+        mpic_pass=0
+        fail_reasons+=("・パブリックDNS (8.8.8.8 または 1.1.1.1) で名前解決に失敗しました (Status: 8.8.8.8=$stat_8888, 1.1.1.1=$stat_1111)。")
+        fail_reasons+=("  [原因推測] 権威DNSサーバー側で、海外からのIPアクセス制限（GeoIPブロッキング）が行われている可能性が高いです。")
+    fi
+
+    # 2. NXDOMAINの不一致 (Split-Horizon)
+    if [[ "$stat_def" == "NOERROR" && ("$stat_8888" == "NXDOMAIN" || "$stat_1111" == "NXDOMAIN") ]]; then
+        mpic_pass=0
+        fail_reasons+=("・デフォルトDNSでは解決できますが、パブリックDNSでNXDOMAIN（存在しない）となりました。")
+        fail_reasons+=("  [原因推測] 内部ネットワーク専用のDNS（スプリットホライズン）で解決されており、外部インターネットから該当ドメインが見えていません。")
+    fi
+
+    # 3. レコードの不一致
+    if [[ "$stat_def" == "NOERROR" && "$stat_8888" == "NOERROR" && "$stat_1111" == "NOERROR" ]]; then
+        if [[ "$caa_def" != "$caa_8888" || "$caa_8888" != "$caa_1111" ]]; then
+            mpic_pass=0
+            fail_reasons+=("・取得されたCAAレコードがDNSサーバー間で一致しませんでした。")
+            fail_reasons+=("  (Default: '$caa_def', 8.8.8.8: '$caa_8888', 1.1.1.1: '$caa_1111')")
+            fail_reasons+=("  [原因推測] ネットワーク環境によって異なるレコードを返しているか、DNS権威サーバー間で同期遅延が発生しています。")
+        fi
+
+        if [[ "$cname_def" != "$cname_8888" || "$cname_8888" != "$cname_1111" ]]; then
+            mpic_pass=0
+            fail_reasons+=("・取得されたCNAMEレコードがDNSサーバー間で一致しませんでした。")
+            fail_reasons+=("  (Default: '$cname_def', 8.8.8.8: '$cname_8888', 1.1.1.1: '$cname_1111')")
+        fi
+    fi
+
+    if [ $mpic_pass -eq 1 ]; then
+        echo "判定結果: ✅ パスする可能性が高いです。"
+        echo "複数のDNS拠点からの応答（ステータス、CAA、CNAME）が一致しています。"
+    else
+        echo "判定結果: ❌ パスしない（エラーになる）可能性が高いです。"
+        echo "以下の原因が考えられます："
+        for reason in "${fail_reasons[@]}"; do
+            echo "$reason"
+        done
+        echo ""
+        echo "※証明書の発行元（CA）からのMPIC検証に失敗し、エラー（例: UPKI エラー338）になる恐れがあります。"
+    fi
+}
+
+# eTLD+1を求める
+ETLD_PLUS_ONE=$(get_etld_plus_one "$TARGET_FQDN" "$PSL_FILE")
+echo "--> Public Suffix Listを元に算出された頂点ドメイン(eTLD+1): $ETLD_PLUS_ONE"
+echo ""
+echo "=================================================="
+echo "対象FQDNと上位ドメイン(デフォルトDNS)の確認"
+echo "=================================================="
+
+current_domain=$TARGET_FQDN
+
+while true; do
+    process_fqdn "$current_domain" ""
+
+    if [ "$current_domain" == "$ETLD_PLUS_ONE" ]; then
+        echo ""
+        echo "--> 頂点ドメイン(eTLD+1: $current_domain) に到達しました。上位への遡りを終了します。"
+        break
+    fi
+
+    # ドットが含まれていない場合は最上位(TLD)まで来たので終了(安全装置)
+    if [[ "$current_domain" != *"."* ]]; then
+        break
+    fi
+
+    # 最初のドットまでを削って上位ドメインへ
+    next_domain=$(echo "$current_domain" | cut -d'.' -f2-)
+    if [ -z "$next_domain" ]; then
+        break
+    fi
+    current_domain=$next_domain
+    echo ""
+    echo "--- 上位FQDN ($current_domain) へ遡ります ---"
+done
+
+echo ""
+echo "=================================================="
+echo "指定DNSでの確認 (8.8.8.8)"
+echo "=================================================="
+process_fqdn "$TARGET_FQDN" "8.8.8.8"
+
+echo ""
+echo "=================================================="
+echo "指定DNSでの確認 (1.1.1.1)"
+echo "=================================================="
+process_fqdn "$TARGET_FQDN" "1.1.1.1"
+
+# MPIC判定の実行
+evaluate_mpic "$TARGET_FQDN"
