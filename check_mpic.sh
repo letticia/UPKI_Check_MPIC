@@ -13,6 +13,9 @@ TARGET_FQDN=$1
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PSL_FILE="$SCRIPT_DIR/public_suffix_list.dat"
 
+# CAAレコードの問題をトラッキングするグローバル変数
+CAA_ERROR_FOUND=0
+
 # Download PSL if not exists
 if [ ! -f "$PSL_FILE" ]; then
     echo "Public Suffix List ($PSL_FILE) が見つかりません。ダウンロードします..."
@@ -134,6 +137,7 @@ process_fqdn() {
             
             if ! echo "$caa_result" | grep -iq "secomtrust\.net"; then
                 echo "CAAレコードが存在しますが、 secomtrust.net が含まれません。発行が抑制され、エラー338の原因になる可能性があります。"
+                CAA_ERROR_FOUND=1
             fi
         else
             if [ $is_cname_target -eq 1 ]; then
@@ -247,6 +251,13 @@ evaluate_mpic() {
             fail_reasons+=("・取得されたCNAMEレコードがDNSサーバー間で一致しませんでした。")
             fail_reasons+=("  (Default: '$cname_def', 8.8.8.8: '$cname_8888', 1.1.1.1: '$cname_1111')")
         fi
+    fi
+
+    # 4. CAAレコードの secomtrust.net 許可確認
+    if [ "$CAA_ERROR_FOUND" -eq 1 ]; then
+        mpic_pass=0
+        fail_reasons+=("・CAAレコードが存在しますが、\"secomtrust.net\" が含まれていません。")
+        fail_reasons+=("  [原因推測] CAAレコードにより証明書の発行が抑制されるため、判定にパスしません。")
     fi
 
     if [ $mpic_pass -eq 1 ]; then
