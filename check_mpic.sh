@@ -125,7 +125,7 @@ process_fqdn() {
 
     while true; do
         # CAAの確認
-        local caa_result=$(dig +short CAA "$current_fqdn" $dns_opt)
+        local caa_result=$(dig +short CAA "$current_fqdn" $dns_opt | grep -E '^[0-9]+\s+')
         if [ -n "$caa_result" ]; then
             if [ $is_cname_target -eq 1 ]; then
                 echo "CNAME先のCAAレコード ($current_fqdn):"
@@ -186,7 +186,7 @@ get_dns_info() {
 
     # タイムアウトを防ぐために +time=3 +tries=2 を付与
     local status=$(dig "$fqdn" $dns_opt +time=3 +tries=2 +noall +comments | grep -ioE "status: [A-Z]+" | awk '{print $2}' | tr '[:lower:]' '[:upper:]')
-    local caa=$(dig +short CAA "$fqdn" $dns_opt +time=3 +tries=2 | sort | tr '\n' ',' | sed 's/,$//')
+    local caa=$(dig +short CAA "$fqdn" $dns_opt +time=3 +tries=2 | grep -E '^[0-9]+\s+' | sort | tr '\n' ',' | sed 's/,$//')
     local cname=$(dig +short CNAME "$fqdn" $dns_opt +time=3 +tries=2 | sort | tr '\n' ',' | sed 's/,$//')
 
     if [ -z "$status" ]; then
