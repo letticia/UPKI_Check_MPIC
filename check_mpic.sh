@@ -115,7 +115,7 @@ process_fqdn() {
     # 名前解決できるか確認
     local code=$(dig "$fqdn" $dns_opt +noall +comments | grep -ioE "status: [A-Z]+" | awk '{print $2}' | tr '[:lower:]' '[:upper:]')
     if [[ "$code" == "NXDOMAIN" || "$code" == "SERVFAIL" ]]; then
-        echo "名前解決ができません。DNSの設定を修正しないと証明書発行が抑制されます。また、エラー338の原因になる可能性があります。"
+        echo "名前解決ができません。DNSの設定を修正しないと証明書発行が抑制されます。CSRによる申請ではエラー338の原因になる可能性があり、ACMEによる発行の場合はACMEクライアント側でエラーになります。"
         return 1
     fi
 
@@ -136,7 +136,7 @@ process_fqdn() {
             fi
             
             if ! echo "$caa_result" | grep -iq "secomtrust\.net"; then
-                echo "CAAレコードが存在しますが、 secomtrust.net が含まれません。発行が抑制され、エラー338の原因になる可能性があります。"
+                echo "CAAレコードが存在しますが、 secomtrust.net が含まれません。発行が抑制され、CSRによる申請ではエラー338の原因になる可能性があり、ACMEによる発行の場合はACMEクライアント側でエラーになります。"
                 CAA_ERROR_FOUND=1
             fi
         else
@@ -230,11 +230,18 @@ evaluate_mpic() {
         fail_reasons+=("  [原因推測] 権威DNSサーバー側で、海外からのIPアクセス制限（GeoIPブロッキング）が行われている可能性が高いです。")
     fi
 
-    # 2. NXDOMAINの不一致 (Split-Horizon)
-    if [[ "$stat_def" == "NOERROR" && ("$stat_8888" == "NXDOMAIN" || "$stat_1111" == "NXDOMAIN") ]]; then
+    # 2. NXDOMAIN (名前解決失敗)
+    if [[ "$stat_def" == "NXDOMAIN" || "$stat_8888" == "NXDOMAIN" || "$stat_1111" == "NXDOMAIN" ]]; then
         mpic_pass=0
-        fail_reasons+=("・デフォルトDNSでは解決できますが、パブリックDNSでNXDOMAIN（存在しない）となりました。")
-        fail_reasons+=("  [原因推測] 内部ネットワーク専用のDNS（スプリットホライズン）で解決されており、外部インターネットから該当ドメインが見えていません。")
+        if [[ "$stat_def" == "NXDOMAIN" && "$stat_8888" == "NXDOMAIN" && "$stat_1111" == "NXDOMAIN" ]]; then
+            fail_reasons+=("・すべてのDNSサーバーでNXDOMAIN（名前解決失敗）となりました。")
+            fail_reasons+=("  [原因推測] 対象FQDNのDNSレコード（Aレコード等）自体が存在しないため、ドメイン所有権の確認(DCV)ができず、証明書は発行できません。")
+        elif [[ "$stat_def" == "NOERROR" ]]; then
+            fail_reasons+=("・デフォルトDNSでは解決できますが、パブリックDNSでNXDOMAIN（存在しない）となりました。")
+            fail_reasons+=("  [原因推測] 内部ネットワーク専用のDNS（スプリットホライズン）で解決されており、外部インターネットから該当ドメインが見えていません。")
+        else
+            fail_reasons+=("・一部のDNSサーバーでNXDOMAIN（名前解決失敗）となりました (Status: Default=$stat_def, 8.8.8.8=$stat_8888, 1.1.1.1=$stat_1111)。")
+        fi
     fi
 
     # 3. レコードの不一致
@@ -270,7 +277,7 @@ evaluate_mpic() {
             echo "$reason"
         done
         echo ""
-        echo "※証明書の発行元（CA）からのMPIC検証に失敗し、エラー（例: UPKI エラー338）になる恐れがあります。"
+        echo "※証明書の発行元（CA）からのMPIC検証に失敗し、CSRによる申請の場合はエラー（例: UPKI エラー338）に、ACMEによる発行の場合はACMEクライアント側でのエラーになる恐れがあります。"
     fi
 }
 
