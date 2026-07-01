@@ -13,9 +13,6 @@ TARGET_FQDN=$1
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PSL_FILE="$SCRIPT_DIR/public_suffix_list.dat"
 
-# CAAレコードの問題をトラッキングするグローバル変数
-CAA_ERROR_FOUND=0
-
 # Download PSL if not exists
 if [ ! -f "$PSL_FILE" ]; then
     echo "Public Suffix List ($PSL_FILE) が見つかりません。ダウンロードします..."
@@ -99,6 +96,65 @@ get_etld_plus_one() {
     fi
 }
 
+# CAAの検索アルゴリズム(RFC 8659)に沿って、CNAME追跡とeTLD+1までの親ドメイン遡りを行い、
+# 実際に発行可否を左右する「実効CAAレコード」を1件だけ探索するヘルパー関数。
+# あるドメインで空でないCAAレコードセットが見つかった時点でそこが実効CAAとなり、
+# それより上位ドメインのCAAは無視される(見つからなければCNAME先→親ドメインの順に遡る)。
+# 出力形式: "CAAが見つかったドメイン名|CAAレコードの内容" (見つからない場合は "|")
+find_relevant_caa() {
+    local fqdn=$1
+    local dns=$2
+    local psl=$3
+    local dns_opt=""
+
+    if [ -n "$dns" ]; then
+        dns_opt="@$dns"
+    fi
+
+    local current="$fqdn"
+    local visited=()
+
+    while true; do
+        local current_lc
+        current_lc=$(echo "$current" | tr '[:upper:]' '[:lower:]')
+
+        local v
+        for v in "${visited[@]}"; do
+            if [ "$v" == "$current_lc" ]; then
+                echo "|"
+                return
+            fi
+        done
+        visited+=("$current_lc")
+
+        # CNAMEがあれば参照先を正としてCAAを確認する
+        # (CNAMEの張られたノードには本来他のレコードは実在せず、dig CAAも自動的にCNAME先の
+        #  結果を返してしまうため、表示ドメイン名を正しくするために先にCNAMEを確認する)
+        local cname
+        cname=$(dig +short CNAME "$current" $dns_opt +time=3 +tries=2 | head -n 1 | sed 's/\.$//')
+        if [ -n "$cname" ]; then
+            current="$cname"
+            continue
+        fi
+
+        local caa
+        caa=$(dig +short CAA "$current" $dns_opt +time=3 +tries=2 | grep -E '^[0-9]+\s+' | sort | tr '\n' ',' | sed 's/,$//')
+        if [ -n "$caa" ]; then
+            echo "$current|$caa"
+            return
+        fi
+
+        # CAAもCNAMEも無ければ、eTLD+1に到達するまで親ドメインへ遡る
+        local etld1
+        etld1=$(get_etld_plus_one "$current" "$psl")
+        if [ "$current" == "$etld1" ] || [[ "$current" != *"."* ]]; then
+            echo "|"
+            return
+        fi
+        current=$(echo "$current" | cut -d'.' -f2-)
+    done
+}
+
 # FQDNの確認処理本体
 process_fqdn() {
     local fqdn=$1
@@ -112,10 +168,14 @@ process_fqdn() {
         echo "=== [$fqdn] の確認 ==="
     fi
 
-    # 名前解決できるか確認
-    local code=$(dig "$fqdn" $dns_opt +noall +comments | grep -ioE "status: [A-Z]+" | awk '{print $2}' | tr '[:lower:]' '[:upper:]')
+    # 名前解決できるか確認 (タイムアウトを防ぐために +time=3 +tries=2 を付与)
+    local code=$(dig "$fqdn" $dns_opt +time=3 +tries=2 +noall +comments | grep -ioE "status: [A-Z]+" | awk '{print $2}' | tr '[:lower:]' '[:upper:]')
     if [[ "$code" == "NXDOMAIN" || "$code" == "SERVFAIL" ]]; then
         echo "名前解決ができません。DNSの設定を修正しないと証明書発行が抑制されます。CSRによる申請ではエラー338の原因になる可能性があり、ACMEによる発行の場合はACMEクライアント側でエラーになります。"
+        return 1
+    fi
+    if [ -z "$code" ]; then
+        echo "DNSクエリがタイムアウトしたか、応答を取得できませんでした。ネットワークまたはDNSサーバーの状態を確認してください。"
         return 1
     fi
 
@@ -136,8 +196,7 @@ process_fqdn() {
             fi
             
             if ! echo "$caa_result" | grep -iq "secomtrust\.net"; then
-                echo "CAAレコードが存在しますが、 secomtrust.net が含まれません。発行が抑制され、CSRによる申請ではエラー338の原因になる可能性があり、ACMEによる発行の場合はACMEクライアント側でエラーになります。"
-                CAA_ERROR_FOUND=1
+                echo "CAAレコードが存在しますが、 secomtrust.net が含まれません。(このドメイン単独でのCAA内容です。実際に発行へ影響するかはMPIC判定結果の実効CAAの確認をご参照ください)"
             fi
         else
             if [ $is_cname_target -eq 1 ]; then
@@ -154,9 +213,10 @@ process_fqdn() {
             echo "CNAMEレコード ($current_fqdn):"
             echo "$cname_result"
             
-            # CNAMEループ検知
+            # CNAMEループ検知 (大文字小文字を区別せずに比較)
+            local next_fqdn_lc=$(echo "$next_fqdn" | tr '[:upper:]' '[:lower:]')
             for visited in "${visited_fqdns[@]}"; do
-                if [ "$visited" == "$next_fqdn" ]; then
+                if [ "$(echo "$visited" | tr '[:upper:]' '[:lower:]')" == "$next_fqdn_lc" ]; then
                     echo "CNAMEのループまたは重複を検知しました ($next_fqdn)。追跡を終了します。"
                     break 2
                 fi
@@ -220,6 +280,19 @@ evaluate_mpic() {
     local caa_1111=$(echo "$res_1111" | cut -d'|' -f2)
     local cname_1111=$(echo "$res_1111" | cut -d'|' -f3)
 
+    # CNAME追跡・eTLD+1までの親ドメイン遡りを考慮した「実効CAAレコード」を各DNS拠点ごとに取得
+    local rel_def=$(find_relevant_caa "$fqdn" "" "$PSL_FILE")
+    local rel_def_domain=$(echo "$rel_def" | cut -d'|' -f1)
+    local rel_def_caa=$(echo "$rel_def" | cut -d'|' -f2)
+
+    local rel_8888=$(find_relevant_caa "$fqdn" "8.8.8.8" "$PSL_FILE")
+    local rel_8888_domain=$(echo "$rel_8888" | cut -d'|' -f1)
+    local rel_8888_caa=$(echo "$rel_8888" | cut -d'|' -f2)
+
+    local rel_1111=$(find_relevant_caa "$fqdn" "1.1.1.1" "$PSL_FILE")
+    local rel_1111_domain=$(echo "$rel_1111" | cut -d'|' -f1)
+    local rel_1111_caa=$(echo "$rel_1111" | cut -d'|' -f2)
+
     local mpic_pass=1
     local fail_reasons=()
 
@@ -260,11 +333,23 @@ evaluate_mpic() {
         fi
     fi
 
-    # 4. CAAレコードの secomtrust.net 許可確認
-    if [ "$CAA_ERROR_FOUND" -eq 1 ]; then
+    # 4. 実効CAAレコード(CNAME追跡・eTLD+1までの親ドメイン遡りの末に最初に見つかったCAA)による許可確認
+    #    ※ 対象ドメイン自身に空でないCAAが見つかればそこで探索を打ち切るため、
+    #      無関係な上位ドメインのCAAレコードが誤って判定に影響することはない
+    if [ -n "$rel_def_domain" ] && ! echo "$rel_def_caa" | grep -iq "secomtrust\.net"; then
         mpic_pass=0
-        fail_reasons+=("・CAAレコードが存在しますが、\"secomtrust.net\" が含まれていません。")
-        fail_reasons+=("  [原因推測] CAAレコードにより証明書の発行が抑制されるため、判定にパスしません。")
+        fail_reasons+=("・デフォルトDNSで実効的に適用されるCAAレコード ($rel_def_domain: $rel_def_caa) に secomtrust.net が含まれません。")
+        fail_reasons+=("  [原因推測] このCAAレコードにより証明書の発行が抑制されるため、判定にパスしません。")
+    fi
+    if [ -n "$rel_8888_domain" ] && ! echo "$rel_8888_caa" | grep -iq "secomtrust\.net"; then
+        mpic_pass=0
+        fail_reasons+=("・8.8.8.8で実効的に適用されるCAAレコード ($rel_8888_domain: $rel_8888_caa) に secomtrust.net が含まれません。")
+        fail_reasons+=("  [原因推測] このCAAレコードにより証明書の発行が抑制されるため、判定にパスしません。")
+    fi
+    if [ -n "$rel_1111_domain" ] && ! echo "$rel_1111_caa" | grep -iq "secomtrust\.net"; then
+        mpic_pass=0
+        fail_reasons+=("・1.1.1.1で実効的に適用されるCAAレコード ($rel_1111_domain: $rel_1111_caa) に secomtrust.net が含まれません。")
+        fail_reasons+=("  [原因推測] このCAAレコードにより証明書の発行が抑制されるため、判定にパスしません。")
     fi
 
     if [ $mpic_pass -eq 1 ]; then
