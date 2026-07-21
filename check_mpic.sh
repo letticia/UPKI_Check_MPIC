@@ -1,4 +1,5 @@
 #!/bin/bash
+# desc: FQDN の CAA/CNAME 設定と MPIC 検証要件をチェックする
 #
 # This software is released under the MIT License.
 # https://opensource.org/licenses/MIT
@@ -10,7 +11,8 @@ if [ -z "$1" ]; then
 fi
 
 TARGET_FQDN=$1
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# シンボリックリンク経由の実行でも実体のあるディレクトリを指すよう解決する
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
 PSL_FILE="$SCRIPT_DIR/public_suffix_list.dat"
 
 # Download PSL if not exists
