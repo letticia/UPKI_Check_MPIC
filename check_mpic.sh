@@ -172,8 +172,19 @@ process_fqdn() {
 
     # 名前解決できるか確認 (タイムアウトを防ぐために +time=3 +tries=2 を付与)
     local code=$(dig "$fqdn" $dns_opt +time=3 +tries=2 +noall +comments | grep -ioE "status: [A-Z]+" | awk '{print $2}' | tr '[:lower:]' '[:upper:]')
-    if [[ "$code" == "NXDOMAIN" || "$code" == "SERVFAIL" ]]; then
-        echo "名前解決ができません。DNSの設定を修正しないと証明書発行が抑制されます。CSRによる申請ではエラー338の原因になる可能性があり、ACMEによる発行の場合はACMEクライアント側でエラーになります。"
+    # NXDOMAIN と SERVFAIL は発行方式への影響が異なるため分けて説明する
+    if [[ "$code" == "NXDOMAIN" ]]; then
+        echo "名前解決ができません (status: NXDOMAIN)。"
+        echo "  [ACME発行の場合] 発行できません。dns-01のチャレンジは _acme-challenge.$fqdn に置く必要がありますが、RFC 8020により"
+        echo "                   NXDOMAINのFQDN配下の名前も存在しないため参照できません(http-01/tls-alpn-01はA/AAAAが必要)。"
+        echo "  [CSR申請の場合]  直ちに発行不可とは限りません。DCVは対象FQDNではなくADN(上位ドメイン)に対して行われるため、"
+        echo "                   上位ADNでDCV済みかつCAAが適切であれば発行され得ます(以降の上位ドメインの確認結果を参照)。"
+        return 1
+    fi
+    if [[ "$code" == "SERVFAIL" ]]; then
+        echo "名前解決ができません (status: SERVFAIL)。"
+        echo "  [CSR申請/ACME発行に共通] SERVFAILはCAAレコードの確認結果も不明にするため、CAはどちらの方式でも発行できません。"
+        echo "                           DNSの設定(委任・DNSSEC等)の修正が必要です。"
         return 1
     fi
     if [ -z "$code" ]; then
@@ -259,13 +270,14 @@ get_dns_info() {
 }
 
 # MPIC判定を行う関数
+# 併せて、検出した不備が「CSRによる申請」「ACMEによる発行」のそれぞれでどう現れるかを分類して出力する。
 evaluate_mpic() {
     local fqdn=$1
     echo ""
     echo "=================================================="
     echo "【MPIC判定結果】 (Multi-Perspective Issuance Corroboration)"
     echo "=================================================="
-    
+
     # それぞれのDNSで情報を取得
     local res_def=$(get_dns_info "$fqdn" "")
     local stat_def=$(echo "$res_def" | cut -d'|' -f1)
@@ -296,62 +308,115 @@ evaluate_mpic() {
     local rel_1111_caa=$(echo "$rel_1111" | cut -d'|' -f2)
 
     local mpic_pass=1
+    # 発行方式ごとの見通し (1=問題なし / 2=条件付き / 0=発行できない)
+    local csr_state=1
+    local acme_state=1
     local fail_reasons=()
 
-    # 1. パブリックDNSでの名前解決失敗
+    # 1. パブリックDNSでの名前解決失敗(SERVFAIL/無応答)
+    #    SERVFAILはCAAの確認結果も「不明」にするため、MPICの裏付けが取れず両方式とも発行できない
     if [[ "$stat_8888" == "SERVFAIL" || "$stat_8888" == "TIMEOUT_OR_ERROR" || "$stat_1111" == "SERVFAIL" || "$stat_1111" == "TIMEOUT_OR_ERROR" ]]; then
         mpic_pass=0
+        csr_state=0
+        acme_state=0
         fail_reasons+=("・パブリックDNS (8.8.8.8 または 1.1.1.1) で名前解決に失敗しました (Status: 8.8.8.8=$stat_8888, 1.1.1.1=$stat_1111)。")
         fail_reasons+=("  [原因推測] 権威DNSサーバー側で、海外からのIPアクセス制限（GeoIPブロッキング）が行われている可能性が高いです。")
+        fail_reasons+=("  [CSR申請の場合]  MPICはACME固有の仕組みではなくBR 3.2.2.4の全DCV方式(CAAの参照を含む)に適用されるため、CSR方式でも同様に発行が抑制されます。")
+        fail_reasons+=("                   (現在は4つのリモート観測点のうち3点以上が主観測点と一致し、かつ2つ以上のRIR地域からの観測が必要)")
+        fail_reasons+=("  [ACME発行の場合] 主観測点からのチャレンジ検証に成功しても、リモート観測点による再検証で裏付けが取れずauthorizationがinvalidになります。")
     fi
 
-    # 2. NXDOMAIN (名前解決失敗)
+    # 2. NXDOMAIN (対象FQDN自体が引けない)
+    #    ここがCSRとACMEで最も挙動が分かれる箇所。
+    #    BRのDCVは対象FQDNではなくADN(Authorization Domain Name: 左のラベルを削って導出する上位ドメイン)に
+    #    対して行われるため、CSR方式では上位ADNのDCV結果が再利用され発行され得る。
+    #    一方ACMEはdns-01が _acme-challenge.<FQDN>、http-01/tls-alpn-01がA/AAAAを必要とし、
+    #    実質ADNが対象FQDNに固定されるため発行できない。
     if [[ "$stat_def" == "NXDOMAIN" || "$stat_8888" == "NXDOMAIN" || "$stat_1111" == "NXDOMAIN" ]]; then
         mpic_pass=0
         if [[ "$stat_def" == "NXDOMAIN" && "$stat_8888" == "NXDOMAIN" && "$stat_1111" == "NXDOMAIN" ]]; then
+            acme_state=0
+            [ $csr_state -eq 1 ] && csr_state=2
             fail_reasons+=("・すべてのDNSサーバーでNXDOMAIN（名前解決失敗）となりました。")
-            fail_reasons+=("  [原因推測] 対象FQDNのDNSレコード（Aレコード等）自体が存在しないため、ドメイン所有権の確認(DCV)ができず、証明書は発行できません。")
+            fail_reasons+=("  [ACME発行の場合] 発行できません。dns-01のチャレンジは _acme-challenge.$fqdn に置く必要がありますが、")
+            fail_reasons+=("                   RFC 8020によりNXDOMAINのFQDN配下の名前も存在しないため参照できません。http-01/tls-alpn-01もA/AAAAが必要です。")
+            fail_reasons+=("  [CSR申請の場合]  直ちに発行不可とは限りません。DCVは対象FQDNではなくADN(上位ドメイン)に対して行われるため、")
+            fail_reasons+=("                   上位ADNでDCV済みかつCAAが適切であれば、対象FQDNがNXDOMAINでも発行され得ます。")
+            fail_reasons+=("                   ただしDCVの再利用可能期間は2026-03-15以降200日に短縮されており(2027-03-15に100日、2029-03-15に10日)、")
+            fail_reasons+=("                   再検証のタイミングでは上位ADN側が解決できる必要があります。")
         elif [[ "$stat_def" == "NOERROR" ]]; then
+            acme_state=0
+            [ $csr_state -eq 1 ] && csr_state=2
             fail_reasons+=("・デフォルトDNSでは解決できますが、パブリックDNSでNXDOMAIN（存在しない）となりました。")
             fail_reasons+=("  [原因推測] 内部ネットワーク専用のDNS（スプリットホライズン）で解決されており、外部インターネットから該当ドメインが見えていません。")
+            fail_reasons+=("  [ACME発行の場合] 発行できません。CAは外部からしか参照しないため、チャレンジ用レコードを外部の権威DNSに公開する必要があります。")
+            fail_reasons+=("  [CSR申請の場合]  対象FQDNが外部から見えなくても、上位ADNでDCV済みかつCAAが適切であれば発行され得ます(上記と同じ理由)。")
         else
+            csr_state=0
+            acme_state=0
             fail_reasons+=("・一部のDNSサーバーでNXDOMAIN（名前解決失敗）となりました (Status: Default=$stat_def, 8.8.8.8=$stat_8888, 1.1.1.1=$stat_1111)。")
+            fail_reasons+=("  [CSR申請/ACME発行に共通] 観測点によって応答が異なるためMPICの裏付け(quorum)が取れず、どちらの方式でも発行が抑制されます。")
         fi
     fi
 
-    # 3. レコードの不一致
+    # 3. レコードの不一致 (MPICの裏付けが取れないため方式によらず発行できない)
     if [[ "$stat_def" == "NOERROR" && "$stat_8888" == "NOERROR" && "$stat_1111" == "NOERROR" ]]; then
         if [[ "$caa_def" != "$caa_8888" || "$caa_8888" != "$caa_1111" ]]; then
             mpic_pass=0
+            csr_state=0
+            acme_state=0
             fail_reasons+=("・取得されたCAAレコードがDNSサーバー間で一致しませんでした。")
             fail_reasons+=("  (Default: '$caa_def', 8.8.8.8: '$caa_8888', 1.1.1.1: '$caa_1111')")
             fail_reasons+=("  [原因推測] ネットワーク環境によって異なるレコードを返しているか、DNS権威サーバー間で同期遅延が発生しています。")
+            fail_reasons+=("  [CSR申請/ACME発行に共通] CAAの参照もMPICの対象です(BGPハイジャックによるCAA迂回を防ぐため)。")
+            fail_reasons+=("                           観測点ごとに応答が食い違うと裏付けが取れず、どちらの方式でも発行できません。")
         fi
 
         if [[ "$cname_def" != "$cname_8888" || "$cname_8888" != "$cname_1111" ]]; then
             mpic_pass=0
+            csr_state=0
+            acme_state=0
             fail_reasons+=("・取得されたCNAMEレコードがDNSサーバー間で一致しませんでした。")
             fail_reasons+=("  (Default: '$cname_def', 8.8.8.8: '$cname_8888', 1.1.1.1: '$cname_1111')")
+            fail_reasons+=("  [CSR申請の場合]  CNAME先が変わるとCAAの探索経路とADNの導出も変わるため、検証が安定せず発行できません。")
+            fail_reasons+=("                   なお2026-11-15に適用期限を迎えるSC-101v2でCNAME追跡とラベル削除の順序が厳格化されます。")
+            fail_reasons+=("  [ACME発行の場合] 観測点ごとに参照されるレコードが変わり、authorizationがinvalidになります。")
         fi
     fi
 
     # 4. 実効CAAレコード(CNAME追跡・eTLD+1までの親ドメイン遡りの末に最初に見つかったCAA)による許可確認
+    #    ※ CAA(RFC 8659)はDCVとは別レイヤの「どのCAが発行してよいか」の許可リストであり、
+    #      上位ドメインへ遡って探すのは仕様どおりの正常動作(NXDOMAINは障害にならない)。方式によらず発行を左右する。
     #    ※ 対象ドメイン自身に空でないCAAが見つかればそこで探索を打ち切るため、
     #      無関係な上位ドメインのCAAレコードが誤って判定に影響することはない
-    if [ -n "$rel_def_domain" ] && ! echo "$rel_def_caa" | grep -iq "secomtrust\.net"; then
-        mpic_pass=0
-        fail_reasons+=("・デフォルトDNSで実効的に適用されるCAAレコード ($rel_def_domain: $rel_def_caa) に secomtrust.net が含まれません。")
-        fail_reasons+=("  [原因推測] このCAAレコードにより証明書の発行が抑制されるため、判定にパスしません。")
+    #    ※ 3拠点で同じ実効CAAが得られた場合は、同じ指摘を3回繰り返さず1件にまとめる
+    local caa_ng=0
+    if [ "$rel_def" == "$rel_8888" ] && [ "$rel_8888" == "$rel_1111" ]; then
+        if [ -n "$rel_def_domain" ] && ! echo "$rel_def_caa" | grep -iq "secomtrust\.net"; then
+            caa_ng=1
+            fail_reasons+=("・実効的に適用されるCAAレコード ($rel_def_domain: $rel_def_caa) に secomtrust.net が含まれません。(全DNS拠点で共通)")
+        fi
+    else
+        if [ -n "$rel_def_domain" ] && ! echo "$rel_def_caa" | grep -iq "secomtrust\.net"; then
+            caa_ng=1
+            fail_reasons+=("・デフォルトDNSで実効的に適用されるCAAレコード ($rel_def_domain: $rel_def_caa) に secomtrust.net が含まれません。")
+        fi
+        if [ -n "$rel_8888_domain" ] && ! echo "$rel_8888_caa" | grep -iq "secomtrust\.net"; then
+            caa_ng=1
+            fail_reasons+=("・8.8.8.8で実効的に適用されるCAAレコード ($rel_8888_domain: $rel_8888_caa) に secomtrust.net が含まれません。")
+        fi
+        if [ -n "$rel_1111_domain" ] && ! echo "$rel_1111_caa" | grep -iq "secomtrust\.net"; then
+            caa_ng=1
+            fail_reasons+=("・1.1.1.1で実効的に適用されるCAAレコード ($rel_1111_domain: $rel_1111_caa) に secomtrust.net が含まれません。")
+        fi
     fi
-    if [ -n "$rel_8888_domain" ] && ! echo "$rel_8888_caa" | grep -iq "secomtrust\.net"; then
+    if [ $caa_ng -eq 1 ]; then
         mpic_pass=0
-        fail_reasons+=("・8.8.8.8で実効的に適用されるCAAレコード ($rel_8888_domain: $rel_8888_caa) に secomtrust.net が含まれません。")
-        fail_reasons+=("  [原因推測] このCAAレコードにより証明書の発行が抑制されるため、判定にパスしません。")
-    fi
-    if [ -n "$rel_1111_domain" ] && ! echo "$rel_1111_caa" | grep -iq "secomtrust\.net"; then
-        mpic_pass=0
-        fail_reasons+=("・1.1.1.1で実効的に適用されるCAAレコード ($rel_1111_domain: $rel_1111_caa) に secomtrust.net が含まれません。")
-        fail_reasons+=("  [原因推測] このCAAレコードにより証明書の発行が抑制されるため、判定にパスしません。")
+        csr_state=0
+        acme_state=0
+        fail_reasons+=("  [原因推測] CAAはDCVとは別レイヤの許可リストで、発行直前(8時間以内、ACMEではfinalize時)にCAが確認します。")
+        fail_reasons+=("  [CSR申請の場合]  上位ADNでのDCVが済んでいても、CAAで拒否されるため発行できません。")
+        fail_reasons+=("  [ACME発行の場合] チャレンジ検証に成功しても、finalize時のCAA確認で拒否され発行できません。")
     fi
 
     if [ $mpic_pass -eq 1 ]; then
@@ -363,8 +428,38 @@ evaluate_mpic() {
         for reason in "${fail_reasons[@]}"; do
             echo "$reason"
         done
+    fi
+
+    # 発行方式ごとの見通し
+    echo ""
+    echo "--------------------------------------------------"
+    echo "【発行方式別の見通し】"
+    case $csr_state in
+        1) echo "  CSR申請  : ✅ DNS/CAA面で発行を妨げる問題は見つかりませんでした。" ;;
+        2) echo "  CSR申請  : ⚠️  上位ADNでDCV済み(200日以内)かつCAAが適切であれば発行され得ます。UPKI/CAへの確認を推奨します。" ;;
+        0) echo "  CSR申請  : ❌ 発行できない可能性が高いです。" ;;
+    esac
+    case $acme_state in
+        1) echo "  ACME発行 : ✅ DNS/CAA面で発行を妨げる問題は見つかりませんでした。(dns-01では別途 _acme-challenge.$fqdn のTXT設置が必要です)" ;;
+        0) echo "  ACME発行 : ❌ 発行できません。" ;;
+    esac
+    echo "--------------------------------------------------"
+
+    if [ $mpic_pass -eq 0 ]; then
         echo ""
-        echo "※証明書の発行元（CA）からのMPIC検証に失敗し、CSRによる申請の場合はエラー（例: UPKI エラー338）に、ACMEによる発行の場合はACMEクライアント側でのエラーになる恐れがあります。"
+        echo "※【発行方式(CSR / ACME)による違い】"
+        echo "  ・MPICはACME固有の仕組みではなく、BR 3.2.2.4のすべてのDCV方式(CAAの参照を含む)に適用されます。"
+        echo "    そのためCAAの不備・観測点間の不一致・SERVFAILは、CSR/ACMEどちらの方式でも発行を抑制します。"
+        echo "  ・両者で挙動が分かれるのは「対象FQDN自体が引けない(NXDOMAIN)」ケースです。"
+        echo "    - CSR申請 : DCVは対象FQDNではなくADN(上位ドメイン)に対して行われ再利用されるため、"
+        echo "                上位ADNでDCV済み＋CAAが適切であれば、NXDOMAINのFQDNでも発行され得ます。"
+        echo "    - ACME発行: dns-01は _acme-challenge.<FQDN>、http-01/tls-alpn-01はA/AAAAを必要とし、"
+        echo "                ADNが対象FQDNに固定されるため発行できません。"
+        echo "  ・エラーの現れ方も異なります。CSR申請では不備が「エラー338」としてUPKI側に記録されますが、"
+        echo "    ACME発行ではエラー338は発生せず、order(証明書要求)ごとにACMEクライアント側のエラーとして返ります。"
+        echo "    自動更新では失敗が表面化しにくいため、気付かないまま証明書が期限切れになる恐れがあります。"
+        echo "  ・DCVの再利用可能期間は2026-03-15以降200日(2027-03-15に100日、2029-03-15に10日)に短縮されており、"
+        echo "    CSR方式で上位ADNのDCV結果を長期間使い回す運用は成立しなくなります。"
     fi
 }
 
@@ -375,6 +470,8 @@ echo ""
 echo "=================================================="
 echo "対象FQDNと上位ドメイン(デフォルトDNS)の確認"
 echo "=================================================="
+echo "※ ここで遡る上位ドメインは、CSR方式でDCVの対象となりうるADN(Authorization Domain Name)の候補でもあります。"
+echo ""
 
 current_domain=$TARGET_FQDN
 
