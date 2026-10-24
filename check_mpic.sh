@@ -13,6 +13,8 @@ usage() {
     echo "                  利用管理者FQDN(11列目)とdNSName(13列目)のホスト名をすべて確認します"
     echo "  -q, --quiet     個別の確認ログを省略し、判定のまとめだけを表示します"
     echo "  -h, --help      この使い方を表示します"
+    echo ""
+    echo "終了コード: 0=すべて問題なし / 1=条件付き(⚠️)または注意あり / 2=発行できない(❌)判定あり / 3=引数やファイルのエラー"
 }
 
 TARGET_FQDN=""
@@ -21,6 +23,12 @@ QUIET=0
 
 # UPKI(セコム)のCAを示すCAAの issuer-domain-name
 CA_DOMAIN="secomtrust.net"
+
+# 終了コード (Nagios などの監視ツールの慣習に合わせる)
+EXIT_OK=0        # すべて問題なし
+EXIT_WARNING=1   # 条件付き(⚠️)の判定、または【注意】がある
+EXIT_CRITICAL=2  # 発行できない(❌)判定がある
+EXIT_ERROR=3     # 引数やファイルのエラーで確認できなかった
 
 # シンボリックリンク経由の実行でも実体のあるディレクトリを指すよう解決する
 # (テストから source された場合もこのファイルの場所を基準にするため、$0 ではなく BASH_SOURCE を使う)
@@ -35,7 +43,7 @@ parse_args() {
             -f|--tsv)
                 if [ -z "$2" ]; then
                     usage
-                    exit 1
+                    exit $EXIT_ERROR
                 fi
                 TSV_FILE=$2
                 shift 2
@@ -51,12 +59,12 @@ parse_args() {
             -*)
                 echo "不明なオプションです: $1"
                 usage
-                exit 1
+                exit $EXIT_ERROR
                 ;;
             *)
                 if [ -n "$TARGET_FQDN" ]; then
                     usage
-                    exit 1
+                    exit $EXIT_ERROR
                 fi
                 TARGET_FQDN=$1
                 shift
@@ -67,11 +75,11 @@ parse_args() {
     # FQDNとTSVはどちらか一方だけを指定する
     if [[ ( -n "$TSV_FILE" && -n "$TARGET_FQDN" ) || ( -z "$TSV_FILE" && -z "$TARGET_FQDN" ) ]]; then
         usage
-        exit 1
+        exit $EXIT_ERROR
     fi
     if [ -n "$TSV_FILE" ] && [ ! -r "$TSV_FILE" ]; then
         echo "TSVファイル ($TSV_FILE) を読み込めません。"
-        exit 1
+        exit $EXIT_ERROR
     fi
 
     # 入力FQDNを正規化する (末尾のドットを除き、小文字にそろえる。PSLとの照合は小文字で行うため)
@@ -84,7 +92,7 @@ ensure_psl() {
         echo "Public Suffix List ($PSL_FILE) が見つかりません。ダウンロードします..."
         if ! curl -sS https://publicsuffix.org/list/public_suffix_list.dat -o "$PSL_FILE" || [ ! -s "$PSL_FILE" ]; then
             echo "Public Suffix List のダウンロードに失敗しました。"
-            exit 1
+            exit $EXIT_ERROR
         fi
     fi
 }
@@ -114,7 +122,7 @@ get_etld_plus_one() {
 
         # 2. 完全一致の確認
         if grep -Fxq "$suffix" "$psl"; then
-            if [ $i -gt 0 ]; then
+            if [ "$i" -gt 0 ]; then
                 local etld1=""
                 for (( j=i-1; j<${#parts[@]}; j++ )); do
                     if [ -n "$etld1" ]; then
@@ -135,7 +143,7 @@ get_etld_plus_one() {
         if [[ "$suffix" == *"."* ]]; then
             local parent=${suffix#*.}
             if grep -Fxq "*.$parent" "$psl"; then
-                if [ $i -gt 0 ]; then
+                if [ "$i" -gt 0 ]; then
                     local etld1=""
                     for (( j=i-1; j<${#parts[@]}; j++ )); do
                         if [ -n "$etld1" ]; then
@@ -414,6 +422,113 @@ get_dns_info() {
     echo "$status|$caa|$cname"
 }
 
+# 権威DNSサーバーへの直接問い合わせの結果
+# (表示と判定で同じFQDNを2回問い合わせないよう、最後に確認したFQDNの結果を保持する)
+AUTH_FQDN=""
+AUTH_ZONE=""
+AUTH_SERVERS=()   # "NS名 (IPv4アドレス)"
+AUTH_STATUS=()
+AUTH_SERIAL=()
+AUTH_CAA=()
+AUTH_CNAME=()
+AUTH_NO_V4=()     # IPv4アドレスが見つからなかったNS名
+
+# 対象FQDNが属するゾーンの権威DNSサーバーを特定し、各サーバーへ再帰なし(+norecurse)で直接問い合わせる。
+# パブリックDNSはキャッシュを持ち、国内の拠点から応答するため、権威DNSサーバー間の不一致や
+# 一部のサーバーの無応答(CAの観測点によって結果が変わる原因)は直接問い合わせないと見えない。
+# - ゾーンは、対象FQDNから eTLD+1 まで遡って最初にNSレコードが見つかったドメインとする
+# - IPv6での到達性は、確認する側の端末にIPv6がないと誤って失敗するため確認しない
+collect_auth_info() {
+    local fqdn=$1
+    [ "$AUTH_FQDN" == "$fqdn" ] && return
+
+    AUTH_FQDN=$fqdn
+    AUTH_ZONE=""
+    AUTH_SERVERS=()
+    AUTH_STATUS=()
+    AUTH_SERIAL=()
+    AUTH_CAA=()
+    AUTH_CNAME=()
+    AUTH_NO_V4=()
+
+    local etld1 name ns_list=""
+    etld1=$(get_etld_plus_one "$fqdn" "$PSL_FILE")
+    name=$fqdn
+    while [ -n "$name" ]; do
+        ns_list=$(dig NS "$name" +time=3 +tries=2 +noall +answer | awk -v n="$name" '
+            { owner = tolower($1); sub(/\.$/, "", owner) }
+            owner == n && $4 == "NS" { v = tolower($5); sub(/\.$/, "", v); print v }' | sort -u)
+        if [ -n "$ns_list" ]; then
+            AUTH_ZONE=$name
+            break
+        fi
+        if [ "$name" == "$etld1" ] || [[ "$name" != *"."* ]]; then
+            break
+        fi
+        name=${name#*.}
+    done
+    [ -z "$AUTH_ZONE" ] && return
+
+    local ns addrs addr opt status serial caa cname
+    for ns in $ns_list; do
+        addrs=$(dig +short A "$ns" +time=3 +tries=2 | grep -E '^[0-9]+(\.[0-9]+){3}$')
+        if [ -z "$addrs" ]; then
+            AUTH_NO_V4+=("$ns")
+            continue
+        fi
+        for addr in $addrs; do
+            opt="@$addr"
+            AUTH_SERVERS+=("$ns ($addr)")
+            status=$(dig "$fqdn" "$opt" +norecurse +time=3 +tries=2 +noall +comments | grep -ioE "status: [A-Z]+" | awk '{print toupper($2)}')
+            [ -z "$status" ] && status="TIMEOUT_OR_ERROR"
+            AUTH_STATUS+=("$status")
+            # 応答しない・拒否するサーバーには、それ以上問い合わせない (タイムアウト待ちを重ねないため)
+            if [ "$status" != "NOERROR" ] && [ "$status" != "NXDOMAIN" ]; then
+                AUTH_SERIAL+=("")
+                AUTH_CAA+=("")
+                AUTH_CNAME+=("")
+                continue
+            fi
+            serial=$(dig +short SOA "$AUTH_ZONE" "$opt" +norecurse +time=3 +tries=2 | awk 'NR == 1 { print $3 }')
+            caa=$(dig CAA "$fqdn" "$opt" +norecurse +time=3 +tries=2 +noall +answer | awk -v n="$fqdn" '
+                { owner = tolower($1); sub(/\.$/, "", owner) }
+                owner == n && $4 == "CAA" { $1 = $2 = $3 = $4 = ""; sub(/^ +/, ""); print }' | sort | tr '\n' ',' | sed 's/,$//')
+            cname=$(dig CNAME "$fqdn" "$opt" +norecurse +time=3 +tries=2 +noall +answer | awk -v n="$fqdn" '
+                { owner = tolower($1); sub(/\.$/, "", owner) }
+                owner == n && $4 == "CNAME" { v = tolower($5); sub(/\.$/, "", v); print v }' | sort | tr '\n' ',' | sed 's/,$//')
+            AUTH_SERIAL+=("$serial")
+            AUTH_CAA+=("$caa")
+            AUTH_CNAME+=("$cname")
+        done
+    done
+}
+
+# 権威DNSサーバーごとの応答を表示する
+print_auth_info() {
+    local fqdn=$1
+    collect_auth_info "$fqdn"
+
+    if [ -z "$AUTH_ZONE" ]; then
+        echo "権威DNSサーバー(NSレコード)を特定できませんでした。"
+        return
+    fi
+    echo "ゾーン: $AUTH_ZONE"
+    local i
+    for (( i=0; i<${#AUTH_SERVERS[@]}; i++ )); do
+        echo "--- ${AUTH_SERVERS[i]} ---"
+        echo "  status: ${AUTH_STATUS[i]}"
+        if [ "${AUTH_STATUS[i]}" == "NOERROR" ] || [ "${AUTH_STATUS[i]}" == "NXDOMAIN" ]; then
+            echo "  SOAシリアル: ${AUTH_SERIAL[i]:-(取得できず)}"
+            echo "  CAA: ${AUTH_CAA[i]:-(なし)}"
+            echo "  CNAME: ${AUTH_CNAME[i]:-(なし)}"
+        fi
+    done
+    for (( i=0; i<${#AUTH_NO_V4[@]}; i++ )); do
+        echo "--- ${AUTH_NO_V4[i]} ---"
+        echo "  IPv4アドレスが見つからないため確認していません。"
+    done
+}
+
 # MPIC判定を行う関数
 # 併せて、検出した不備が「CSRによる申請」「ACMEによる発行」のそれぞれでどう現れるかを分類して出力する。
 evaluate_mpic() {
@@ -587,6 +702,62 @@ evaluate_mpic() {
         fail_reasons+=("  [ACME発行の場合] チャレンジ検証に成功しても、finalize時のCAA確認で拒否され発行できません。")
     fi
 
+    # 5. 権威DNSサーバーへの直接問い合わせ
+    #    CAのDNS観測点は、どの権威DNSサーバーに問い合わせるかが観測点ごと・問い合わせごとに異なる。
+    #    サーバー間で応答が食い違えば観測点間で結果が揃わず、MPICの裏付けが取れない(方式によらず発行できない)。
+    #    一部のサーバーの無応答やSOAシリアルの不一致は、必ず失敗するとは限らないため【注意】として扱う。
+    local warnings=()
+    collect_auth_info "$fqdn"
+    if [ -z "$AUTH_ZONE" ]; then
+        warnings+=("・権威DNSサーバー(NSレコード)を特定できなかったため、権威DNSサーバーへの直接確認は行っていません。")
+    else
+        local ok_count=0 first_key="" key auth_mismatch=0 serials="" lame=() auth_lines=()
+        for (( i=0; i<${#AUTH_SERVERS[@]}; i++ )); do
+            if [ "${AUTH_STATUS[i]}" == "NOERROR" ] || [ "${AUTH_STATUS[i]}" == "NXDOMAIN" ]; then
+                ok_count=$((ok_count + 1))
+                key="${AUTH_STATUS[i]}|${AUTH_CAA[i]}|${AUTH_CNAME[i]}"
+                if [ -z "$first_key" ]; then
+                    first_key=$key
+                elif [ "$key" != "$first_key" ]; then
+                    auth_mismatch=1
+                fi
+                serials="$serials${AUTH_SERIAL[i]}"$'\n'
+                auth_lines+=("  ${AUTH_SERVERS[i]}: status=${AUTH_STATUS[i]}, CAA='${AUTH_CAA[i]}', CNAME='${AUTH_CNAME[i]}', SOAシリアル=${AUTH_SERIAL[i]}")
+            else
+                lame+=("${AUTH_SERVERS[i]}: ${AUTH_STATUS[i]}")
+            fi
+        done
+
+        if [ $auth_mismatch -eq 1 ]; then
+            mpic_pass=0
+            csr_state=0
+            acme_state=0
+            fail_reasons+=("・権威DNSサーバー間で応答(ステータス、CAA、CNAME)が一致しませんでした。(ゾーン: $AUTH_ZONE)")
+            fail_reasons+=("${auth_lines[@]}")
+            fail_reasons+=("  [原因推測] 一部の権威DNSサーバーへの設定の反映漏れや、ゾーン転送の失敗が考えられます。")
+            fail_reasons+=("  [CSR申請/ACME発行に共通] CAのDNS観測点はどの権威DNSサーバーに問い合わせるかが毎回異なるため、")
+            fail_reasons+=("                           観測点ごとに結果が食い違い、どちらの方式でも発行が抑制されます。")
+        elif [ "$(printf '%s' "$serials" | sort -u | grep -c .)" -gt 1 ]; then
+            warnings+=("・権威DNSサーバー間でSOAシリアルが一致しません。(ゾーン: $AUTH_ZONE)")
+            warnings+=("${auth_lines[@]}")
+            warnings+=("  今回確認したレコードは一致していますが、ゾーンの同期が遅れているか、一部のサーバーが更新されていない可能性があります。")
+        fi
+
+        if [ $ok_count -eq 0 ]; then
+            warnings+=("・権威DNSサーバーのどれにも直接問い合わせできませんでした。(ゾーン: $AUTH_ZONE)")
+            warnings+=("  この端末からDNS(53番ポート)への通信が制限されている可能性があります。パブリックDNSでの確認結果をご参照ください。")
+        elif [ ${#lame[@]} -gt 0 ]; then
+            warnings+=("・一部の権威DNSサーバーが正常に応答しません。(ゾーン: $AUTH_ZONE)")
+            for (( i=0; i<${#lame[@]}; i++ )); do
+                warnings+=("  ${lame[i]}")
+            done
+            warnings+=("  CAのDNS観測点がこのサーバーに問い合わせると時間切れや失敗になり、MPICの裏付けが取れない場合があります。")
+        fi
+        if [ ${#AUTH_NO_V4[@]} -gt 0 ]; then
+            warnings+=("・IPv4アドレスが見つからない権威DNSサーバーがあります (${AUTH_NO_V4[*]})。IPv6での到達性は確認していません。")
+        fi
+    fi
+
     # 呼び出し元(まとめ表示)で使うため、判定結果をグローバル変数にも残す
     MPIC_CSR_STATE=$csr_state
     MPIC_ACME_STATE=$acme_state
@@ -594,14 +765,26 @@ evaluate_mpic() {
     if [ ${#fail_reasons[@]} -gt 0 ]; then
         MPIC_REASON=${fail_reasons[0]#・}
     fi
+    MPIC_WARNING=""
+    if [ ${#warnings[@]} -gt 0 ]; then
+        MPIC_WARNING=${warnings[0]#・}
+    fi
 
     if [ $mpic_pass -eq 1 ]; then
         echo "判定結果: ✅ パスする可能性が高いです。"
-        echo "複数のDNS拠点からの応答（ステータス、CAA、CNAME）が一致しています。"
+        echo "複数のDNS拠点と権威DNSサーバーからの応答（ステータス、CAA、CNAME）が一致しています。"
     else
         echo "判定結果: ❌ パスしない（エラーになる）可能性が高いです。"
         echo "以下の原因が考えられます："
         for reason in "${fail_reasons[@]}"; do
+            echo "$reason"
+        done
+    fi
+
+    if [ ${#warnings[@]} -gt 0 ]; then
+        echo ""
+        echo "【注意】"
+        for reason in "${warnings[@]}"; do
             echo "$reason"
         done
     fi
@@ -690,6 +873,12 @@ check_one_fqdn() {
     echo "指定DNSでの確認 (1.1.1.1)"
     echo "=================================================="
     process_fqdn "$target" "1.1.1.1"
+
+    echo ""
+    echo "=================================================="
+    echo "権威DNSサーバーでの確認 (再帰なしで直接問い合わせ)"
+    echo "=================================================="
+    print_auth_info "$target"
 
     # MPIC判定の実行
     evaluate_mpic "$target"
@@ -787,6 +976,7 @@ CHECKED_FQDNS=()
 CHECKED_CSR=()
 CHECKED_ACME=()
 CHECKED_REASON=()
+CHECKED_WARNING=()
 
 # 確認済みならその添字を、未確認なら空を出力する
 find_checked() {
@@ -825,6 +1015,7 @@ run_check() {
     CHECKED_CSR+=("$MPIC_CSR_STATE")
     CHECKED_ACME+=("$MPIC_ACME_STATE")
     CHECKED_REASON+=("$MPIC_REASON")
+    CHECKED_WARNING+=("$MPIC_WARNING")
 }
 
 # 判定値(1=問題なし / 2=条件付き / 0=発行できない)を記号にする
@@ -857,8 +1048,26 @@ print_host_result() {
     line=$(printf "%s%-40s CSR: %s  ACME: %s" "$indent" "$fqdn" "$(state_mark "${CHECKED_CSR[idx]}")" "$(state_mark "${CHECKED_ACME[idx]}")")
     if [ -n "${CHECKED_REASON[idx]}" ]; then
         line="$line  ← ${CHECKED_REASON[idx]}"
+    elif [ -n "${CHECKED_WARNING[idx]}" ]; then
+        line="$line  ← 注意: ${CHECKED_WARNING[idx]}"
     fi
     echo "$line"
+}
+
+# 確認したすべてのFQDNのうち最も悪い結果から終了コードを決める
+# (CSR / ACME のどちらかが ❌ なら EXIT_CRITICAL とする)
+overall_exit_code() {
+    local i code=$EXIT_OK
+    for (( i=0; i<${#CHECKED_FQDNS[@]}; i++ )); do
+        if [ "${CHECKED_CSR[i]}" == "0" ] || [ "${CHECKED_ACME[i]}" == "0" ]; then
+            echo $EXIT_CRITICAL
+            return
+        fi
+        if [ "${CHECKED_CSR[i]}" == "2" ] || [ "${CHECKED_ACME[i]}" == "2" ] || [ -n "${CHECKED_WARNING[i]}" ]; then
+            code=$EXIT_WARNING
+        fi
+    done
+    echo $code
 }
 
 # 申請行ごとのまとめを表示する
@@ -874,18 +1083,20 @@ print_tsv_summary() {
     for (( r=0; r<${#ROW_LINES[@]}; r++ )); do
         local row_csr=1
         local row_acme=1
+        local row_note=""
         local n=0
         for host in ${ROW_HOSTS[r]}; do
             idx=$(find_checked "$host")
             row_csr=$(worse_state "$row_csr" "${CHECKED_CSR[idx]}")
             row_acme=$(worse_state "$row_acme" "${CHECKED_ACME[idx]}")
+            [ -n "${CHECKED_WARNING[idx]}" ] && row_note="  (注意あり)"
             n=$((n + 1))
         done
 
         local cn=${ROW_CNS[r]}
         [ -z "$cn" ] && cn="(利用管理者FQDN未記入)"
         echo ""
-        echo "行${ROW_LINES[r]}  CN=$cn  (ホスト名${n}件)  CSR: $(state_mark "$row_csr")  ACME: $(state_mark "$row_acme")"
+        echo "行${ROW_LINES[r]}  CN=$cn  (ホスト名${n}件)  CSR: $(state_mark "$row_csr")  ACME: $(state_mark "$row_acme")$row_note"
         for host in ${ROW_HOSTS[r]}; do
             print_host_result "$host" "    - "
         done
@@ -896,6 +1107,7 @@ print_tsv_summary() {
     echo "※ 1枚の証明書(ACMEでは1回のorder)に含まれるホスト名が1つでも発行できない場合は申請全体が失敗するため、"
     echo "  行の判定は最も悪いホスト名の結果に合わせています。"
     echo "※ ⚠️  は、上位ADNでDCV済み(200日以内)かつCAAが適切であれば発行され得る状態です。"
+    echo "※ (注意あり) は、判定には影響しないものの、権威DNSサーバーの応答などに確認したほうがよい点がある状態です。"
     if [ $QUIET -eq 1 ]; then
         echo "※ 原因の詳細は -q を付けずに実行した個別の確認ログを参照してください。"
     fi
@@ -912,7 +1124,7 @@ main() {
         parse_tsv "$TSV_FILE"
         if [ ${#ROW_LINES[@]} -eq 0 ]; then
             echo "確認対象のホスト名がTSVに見つかりませんでした。"
-            exit 1
+            exit $EXIT_ERROR
         fi
 
         for (( r=0; r<${#ROW_LINES[@]}; r++ )); do
@@ -925,13 +1137,15 @@ main() {
     else
         if ! is_valid_hostname "$TARGET_FQDN"; then
             echo "「${TARGET_FQDN}」はFQDNの形式ではありません。URLではなくホスト名だけを指定してください。(例: www.example.ac.jp)"
-            exit 1
+            exit $EXIT_ERROR
         fi
         run_check "$TARGET_FQDN" ""
         if [ $QUIET -eq 1 ]; then
             print_host_result "$TARGET_FQDN" ""
         fi
     fi
+
+    exit "$(overall_exit_code)"
 }
 
 # テストから source された場合は関数の定義だけを読み込み、実行はしない

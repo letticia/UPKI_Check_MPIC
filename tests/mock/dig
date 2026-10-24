@@ -11,7 +11,10 @@
 #   <リゾルバ> <名前> <タイプ> <値...>
 #   - リゾルバは "*"(すべて) / "default"(@指定なし) / "8.8.8.8" などのサーバ名
 #   - ある名前についてリゾルバ固有の行があれば、その名前では "*" の行より優先する
-#   - タイプ STATUS は応答ステータスを上書きする (SERVFAIL / NXDOMAIN / TIMEOUT)
+#   - リゾルバ固有の行では名前に "*" を書くと、そのリゾルバへのすべての問い合わせに効く
+#     (例: "192.0.2.82 * STATUS TIMEOUT" で、応答しない権威DNSサーバーを表す)
+#   - タイプ STATUS は応答ステータスを上書きする (SERVFAIL / NXDOMAIN / REFUSED / TIMEOUT)
+#   - +norecurse は無視する (権威DNSサーバーもIPアドレスをリゾルバ名として同じように扱う)
 #   - CNAME は問い合わせタイプが CNAME 以外ならたどる。名前自身か配下にレコードがなければ NXDOMAIN
 
 zone=${MOCK_DNS_ZONE:?MOCK_DNS_ZONE が設定されていません}
@@ -41,14 +44,16 @@ records() {
         {
             n = tolower($2)
             sub(/\.$/, "", n)
-            if (n != name) next
             v = $0
             sub(/^[ \t]*[^ \t]+[ \t]+[^ \t]+[ \t]+/, "", v)
+            if ($1 == res && n == "*") all[++na] = v
+            if (n != name) next
             if ($1 == res) spec[++ns] = v
             else if ($1 == "*") gen[++ng] = v
         }
         END {
-            if (ns > 0) { for (i = 1; i <= ns; i++) print spec[i] }
+            if (na > 0) { for (i = 1; i <= na; i++) print all[i] }
+            else if (ns > 0) { for (i = 1; i <= ns; i++) print spec[i] }
             else { for (i = 1; i <= ng; i++) print gen[i] }
         }' "$zone"
 }
@@ -94,7 +99,9 @@ for _ in 1 2 3 4 5 6 7 8; do
 
     while read -r value; do
         [ -z "$value" ] && continue
-        [ "$qtype" == "CNAME" ] && value="${value%.}."
+        if [ "$qtype" == "CNAME" ] || [ "$qtype" == "NS" ]; then
+            value="${value%.}."
+        fi
         answers+="$current. 300 IN $qtype $value"$'\n'
     done <<< "$(echo "$recs" | awk -v t="$qtype" '$1 == t { sub(/^[^ \t]+[ \t]+/, ""); print }')"
     break

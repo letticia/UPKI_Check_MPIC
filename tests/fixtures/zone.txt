@@ -59,3 +59,70 @@
 default  internal.alpha.ac.jp  A  10.0.0.1
 8.8.8.8  internal.alpha.ac.jp  STATUS  NXDOMAIN
 1.1.1.1  internal.alpha.ac.jp  STATUS  NXDOMAIN
+
+# --- 権威DNSサーバー ---
+# 各テスト用ゾーンの権威DNSサーバー (権威サーバーへの問い合わせは、そのIPアドレスをリゾルバ名として扱う)
+*  ns1.dns-provider.net  A  192.0.2.53
+*  ns2.dns-provider.net  A  192.0.2.54
+*  alpha.ac.jp  NS  ns1.dns-provider.net
+*  alpha.ac.jp  NS  ns2.dns-provider.net
+*  alpha.ac.jp  SOA  ns1.dns-provider.net. hostmaster.alpha.ac.jp. 2026102501 3600 900 604800 300
+*  bravo.ac.jp  NS  ns1.dns-provider.net
+*  bravo.ac.jp  NS  ns2.dns-provider.net
+*  bravo.ac.jp  SOA  ns1.dns-provider.net. hostmaster.bravo.ac.jp. 2026102501 3600 900 604800 300
+*  charlie.ac.jp  NS  ns1.dns-provider.net
+*  charlie.ac.jp  NS  ns2.dns-provider.net
+*  charlie.ac.jp  SOA  ns1.dns-provider.net. hostmaster.charlie.ac.jp. 2026102501 3600 900 604800 300
+*  delta.ac.jp  NS  ns1.dns-provider.net
+*  delta.ac.jp  NS  ns2.dns-provider.net
+*  delta.ac.jp  SOA  ns1.dns-provider.net. hostmaster.delta.ac.jp. 2026102501 3600 900 604800 300
+*  echo.ac.jp  NS  ns1.dns-provider.net
+*  echo.ac.jp  NS  ns2.dns-provider.net
+*  echo.ac.jp  SOA  ns1.dns-provider.net. hostmaster.echo.ac.jp. 2026102501 3600 900 604800 300
+*  foxtrot.ac.jp  NS  ns1.dns-provider.net
+*  foxtrot.ac.jp  NS  ns2.dns-provider.net
+*  foxtrot.ac.jp  SOA  ns1.dns-provider.net. hostmaster.foxtrot.ac.jp. 2026102501 3600 900 604800 300
+# hotel.ac.jp は NS レコードがない (権威DNSサーバーを特定できない) ケースとして残す
+
+# 権威DNSサーバー間でCAAが一致しない → 不可 (パブリックDNSでは一致して見える)
+*  www.kilo.ac.jp  A  192.0.2.20
+*  www.kilo.ac.jp  CAA  0 issue "secomtrust.net"
+*  kilo.ac.jp  NS  ns1.kilo-dns.net
+*  kilo.ac.jp  NS  ns2.kilo-dns.net
+*  kilo.ac.jp  SOA  ns1.kilo-dns.net. hostmaster.kilo.ac.jp. 2026102501 3600 900 604800 300
+*  ns1.kilo-dns.net  A  192.0.2.61
+*  ns2.kilo-dns.net  A  192.0.2.62
+192.0.2.62  www.kilo.ac.jp  A  192.0.2.20
+192.0.2.62  www.kilo.ac.jp  CAA  0 issue "letsencrypt.org"
+
+# 権威DNSサーバー間でSOAシリアルだけが一致しない → 判定は可、【注意】
+*  www.lima.ac.jp  A  192.0.2.21
+*  lima.ac.jp  CAA  0 issue "secomtrust.net"
+*  lima.ac.jp  NS  ns1.lima-dns.net
+*  lima.ac.jp  NS  ns2.lima-dns.net
+*  lima.ac.jp  SOA  ns1.lima-dns.net. hostmaster.lima.ac.jp. 2026102501 3600 900 604800 300
+*  ns1.lima-dns.net  A  192.0.2.71
+*  ns2.lima-dns.net  A  192.0.2.72
+192.0.2.72  lima.ac.jp  CAA  0 issue "secomtrust.net"
+192.0.2.72  lima.ac.jp  SOA  ns1.lima-dns.net. hostmaster.lima.ac.jp. 2026102400 3600 900 604800 300
+
+# 一部の権威DNSサーバーが応答しない・拒否する、IPv4アドレスがない → 判定は可、【注意】
+*  www.mike.ac.jp  A  192.0.2.22
+*  www.mike.ac.jp  CAA  0 issue "secomtrust.net"
+*  mike.ac.jp  NS  ns1.mike-dns.net
+*  mike.ac.jp  NS  ns2.mike-dns.net
+*  mike.ac.jp  NS  ns3.mike-dns.net
+*  mike.ac.jp  NS  ns6.mike-dns.net
+*  mike.ac.jp  SOA  ns1.mike-dns.net. hostmaster.mike.ac.jp. 2026102501 3600 900 604800 300
+*  ns1.mike-dns.net  A  192.0.2.81
+*  ns2.mike-dns.net  A  192.0.2.82
+*  ns3.mike-dns.net  A  192.0.2.83
+*  ns6.mike-dns.net  AAAA  2001:db8::53
+192.0.2.82  *  STATUS  TIMEOUT
+192.0.2.83  *  STATUS  REFUSED
+
+# すべての権威DNSサーバーに直接問い合わせできない (端末からの53番ポートの制限を想定) → 判定は可、【注意】
+*  www.november.ac.jp  A  192.0.2.23
+*  november.ac.jp  NS  ns1.november-dns.net
+*  ns1.november-dns.net  A  192.0.2.91
+192.0.2.91  *  STATUS  TIMEOUT

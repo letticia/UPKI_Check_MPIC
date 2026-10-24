@@ -132,6 +132,23 @@ assert_eq "CNAME先自身のCAA" 'www.foxtrot.ac.jp(CNAME先: foxtrot-host.net)|
 assert_eq "CAAがどこにもない" '|' "$(find_relevant_caa plain.hotel.ac.jp "")"
 assert_eq "DNS拠点ごとに異なるCAA" 'split.alpha.ac.jp|0 issue "letsencrypt.org"' "$(find_relevant_caa split.alpha.ac.jp 1.1.1.1)"
 
+echo "■ collect_auth_info"
+collect_auth_info ok.alpha.ac.jp
+assert_eq "ゾーン(親ドメインのNS)" "alpha.ac.jp" "$AUTH_ZONE"
+assert_eq "権威DNSサーバー" "ns1.dns-provider.net (192.0.2.53)|ns2.dns-provider.net (192.0.2.54)" "$(IFS='|'; echo "${AUTH_SERVERS[*]}")"
+assert_eq "ステータス" "NOERROR NOERROR" "${AUTH_STATUS[*]}"
+assert_eq "SOAシリアル" "2026102501 2026102501" "${AUTH_SERIAL[*]}"
+collect_auth_info www.kilo.ac.jp
+assert_eq "サーバーごとのCAA" '0 issue "secomtrust.net"|0 issue "letsencrypt.org"' "$(IFS='|'; echo "${AUTH_CAA[*]}")"
+collect_auth_info www.delta.ac.jp
+assert_eq "CNAMEはサーバー自身の応答から取る" "edge.cdn-delta.net edge.cdn-delta.net" "${AUTH_CNAME[*]}"
+assert_eq "CNAMEのノードではCAAなし" "|" "$(IFS='|'; echo "${AUTH_CAA[*]}")"
+collect_auth_info www.mike.ac.jp
+assert_eq "応答しない・拒否するサーバー" "NOERROR TIMEOUT_OR_ERROR REFUSED" "${AUTH_STATUS[*]}"
+assert_eq "IPv4アドレスのないNS" "ns6.mike-dns.net" "${AUTH_NO_V4[*]}"
+collect_auth_info plain.hotel.ac.jp
+assert_eq "NSが見つからない" "" "$AUTH_ZONE"
+
 echo "■ parse_tsv"
 # UPKIの申請TSVと同じ Shift-JIS / CR+LF / 13列のファイルを作る
 make_tsv() {
@@ -204,12 +221,48 @@ assert_contains "CNAME先のCAAであることを表示" "www.foxtrot.ac.jp(CNAM
 run_script iodef.charlie.ac.jp
 assert_contains "iodefは許可にならない" "[理由] issueで許可されているCA(letsencrypt.org)に secomtrust.net が含まれません" "$RUN_OUTPUT"
 
+echo "■ 権威DNSサーバーでの確認"
+assert_judgement www.kilo.ac.jp "❌" "❌"
+run_script -q www.kilo.ac.jp
+assert_contains "権威DNSサーバー間の不一致" "権威DNSサーバー間で応答(ステータス、CAA、CNAME)が一致しませんでした。(ゾーン: kilo.ac.jp)" "$RUN_OUTPUT"
+run_script www.kilo.ac.jp
+assert_contains "不一致のサーバーごとの応答" "ns2.kilo-dns.net (192.0.2.62): status=NOERROR, CAA='0 issue \"letsencrypt.org\"'" "$RUN_OUTPUT"
+assert_judgement www.lima.ac.jp "✅" "✅"
+run_script -q www.lima.ac.jp
+assert_contains "SOAシリアルの不一致は注意" "← 注意: 権威DNSサーバー間でSOAシリアルが一致しません。(ゾーン: lima.ac.jp)" "$RUN_OUTPUT"
+assert_judgement www.mike.ac.jp "✅" "✅"
+run_script www.mike.ac.jp
+assert_contains "注意の見出し" "【注意】" "$RUN_OUTPUT"
+assert_contains "応答しないサーバー" "ns2.mike-dns.net (192.0.2.82): TIMEOUT_OR_ERROR" "$RUN_OUTPUT"
+assert_contains "拒否するサーバー" "ns3.mike-dns.net (192.0.2.83): REFUSED" "$RUN_OUTPUT"
+assert_contains "IPv4アドレスのないサーバー" "IPv4アドレスが見つからない権威DNSサーバーがあります (ns6.mike-dns.net)" "$RUN_OUTPUT"
+assert_contains "詳細表示の節" "権威DNSサーバーでの確認 (再帰なしで直接問い合わせ)" "$RUN_OUTPUT"
+assert_contains "詳細表示のサーバーごとの応答" "--- ns1.mike-dns.net (192.0.2.81) ---" "$RUN_OUTPUT"
+run_script -q www.november.ac.jp
+assert_contains "どの権威DNSサーバーにも問い合わせできない" "← 注意: 権威DNSサーバーのどれにも直接問い合わせできませんでした" "$RUN_OUTPUT"
+run_script -q plain.hotel.ac.jp
+assert_contains "NSを特定できない" "← 注意: 権威DNSサーバー(NSレコード)を特定できなかった" "$RUN_OUTPUT"
+run_script -q ok.alpha.ac.jp
+assert_not_contains "問題がなければ注意を出さない" "注意" "$RUN_OUTPUT"
+
+echo "■ 終了コード"
+run_script -q ok.alpha.ac.jp
+assert_eq "問題なし → 0" "0" "$LAST_STATUS"
+run_script ok.alpha.ac.jp
+assert_eq "詳細表示でも同じ" "0" "$LAST_STATUS"
+run_script -q www.lima.ac.jp
+assert_eq "注意あり → 1" "1" "$LAST_STATUS"
+run_script -q www.kilo.ac.jp
+assert_eq "発行できない → 2" "2" "$LAST_STATUS"
+run_script -q missing.alpha.ac.jp
+assert_eq "CSRは条件付きでもACMEが発行できない → 2" "2" "$LAST_STATUS"
+
 echo "■ 入力の正規化"
 run_script -q OK.ALPHA.AC.JP.
 assert_contains "末尾のドットと大文字" "ok.alpha.ac.jp" "$RUN_OUTPUT"
 assert_contains "末尾のドットと大文字の判定" "CSR: ✅" "$RUN_OUTPUT"
 run_script -q https://ok.alpha.ac.jp/
-assert_eq "URLはエラー(終了コード)" "1" "$LAST_STATUS"
+assert_eq "URLはエラー(終了コード)" "3" "$LAST_STATUS"
 assert_contains "URLはエラー(メッセージ)" "FQDNの形式ではありません" "$RUN_OUTPUT"
 
 echo "■ 詳細表示 (-q なし)"
@@ -227,6 +280,20 @@ assert_contains "行2" "行2  CN=Www.Alpha.Ac.Jp  (ホスト名1件)  CSR: ✅  
 assert_contains "行5" "行5  CN=ok.alpha.ac.jp  (ホスト名1件)  CSR: ✅  ACME: ✅" "$RUN_OUTPUT"
 assert_not_contains "失効申請の行はまとめに出ない" "行3  CN=" "$RUN_OUTPUT"
 assert_eq "同じホスト名は1回だけ確認する" "3" "$(echo "$RUN_OUTPUT" | grep -c '^確認中: ')"
+assert_eq "発行できない行があれば終了コード 2" "2" "$LAST_STATUS"
+
+TSV_OK="$WORK_DIR/ok.tsv"
+make_tsv "$TSV_OK" \
+    "$DN${T}3${T}${T}${T}${T}${T}CSR${T}名${T}所属${T}a@b${T}ok.alpha.ac.jp${T}nginx${T}dNSName=www.alpha.ac.jp"
+run_script -q -f "$TSV_OK"
+assert_eq "すべて問題なければ終了コード 0" "0" "$LAST_STATUS"
+
+TSV_NOTE="$WORK_DIR/note.tsv"
+make_tsv "$TSV_NOTE" \
+    "$DN${T}3${T}${T}${T}${T}${T}CSR${T}名${T}所属${T}a@b${T}ok.alpha.ac.jp${T}nginx${T}dNSName=www.lima.ac.jp"
+run_script -q -f "$TSV_NOTE"
+assert_contains "注意のあるホスト名を含む行" "CSR: ✅  ACME: ✅  (注意あり)" "$RUN_OUTPUT"
+assert_eq "注意ありなら終了コード 1" "1" "$LAST_STATUS"
 
 echo "■ 申請TSV (-f、-q なし)"
 run_script -f "$TSV"
@@ -235,20 +302,20 @@ assert_contains "まとめも表示" "【申請行ごとのまとめ】" "$RUN_O
 
 echo "■ 引数のエラー"
 run_script
-assert_eq "引数なし" "1" "$LAST_STATUS"
+assert_eq "引数なし" "3" "$LAST_STATUS"
 run_script -f
-assert_eq "-f の引数なし" "1" "$LAST_STATUS"
+assert_eq "-f の引数なし" "3" "$LAST_STATUS"
 run_script -f "$WORK_DIR/nofile.tsv"
-assert_eq "存在しないTSV" "1" "$LAST_STATUS"
+assert_eq "存在しないTSV" "3" "$LAST_STATUS"
 run_script -f "$TSV" ok.alpha.ac.jp
-assert_eq "FQDNとTSVの両方を指定" "1" "$LAST_STATUS"
+assert_eq "FQDNとTSVの両方を指定" "3" "$LAST_STATUS"
 run_script -x
 assert_contains "不明なオプション" "不明なオプションです: -x" "$RUN_OUTPUT"
 run_script -h
 assert_eq "-h は正常終了" "0" "$LAST_STATUS"
 make_tsv "$WORK_DIR/empty.tsv" "a${T}b"
 run_script -f "$WORK_DIR/empty.tsv"
-assert_eq "確認対象のないTSV" "1" "$LAST_STATUS"
+assert_eq "確認対象のないTSV" "3" "$LAST_STATUS"
 
 echo ""
 echo "結果: 成功 $PASSED 件 / 失敗 $FAILED 件"
