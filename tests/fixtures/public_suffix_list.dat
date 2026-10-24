@@ -1,0 +1,11 @@
+// テスト用の最小限の Public Suffix List (本物のリストの一部と同じ書式)
+// ===BEGIN ICANN DOMAINS===
+jp
+ac.jp
+co.jp
+com
+net
+// ワイルドカードと例外のルール
+*.kawasaki.jp
+!city.kawasaki.jp
+// ===END ICANN DOMAINS===

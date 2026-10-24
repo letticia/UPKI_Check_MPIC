@@ -18,69 +18,76 @@ usage() {
 TARGET_FQDN=""
 TSV_FILE=""
 QUIET=0
-while [ $# -gt 0 ]; do
-    case "$1" in
-        -f|--tsv)
-            if [ -z "$2" ]; then
-                usage
-                exit 1
-            fi
-            TSV_FILE=$2
-            shift 2
-            ;;
-        -q|--quiet)
-            QUIET=1
-            shift
-            ;;
-        -h|--help)
-            usage
-            exit 0
-            ;;
-        -*)
-            echo "不明なオプションです: $1"
-            usage
-            exit 1
-            ;;
-        *)
-            if [ -n "$TARGET_FQDN" ]; then
-                usage
-                exit 1
-            fi
-            TARGET_FQDN=$1
-            shift
-            ;;
-    esac
-done
-
-# FQDNとTSVはどちらか一方だけを指定する
-if [[ ( -n "$TSV_FILE" && -n "$TARGET_FQDN" ) || ( -z "$TSV_FILE" && -z "$TARGET_FQDN" ) ]]; then
-    usage
-    exit 1
-fi
-if [ -n "$TSV_FILE" ] && [ ! -r "$TSV_FILE" ]; then
-    echo "TSVファイル ($TSV_FILE) を読み込めません。"
-    exit 1
-fi
-
-# 入力FQDNを正規化する (末尾のドットを除き、小文字にそろえる。PSLとの照合は小文字で行うため)
-TARGET_FQDN=$(echo "$TARGET_FQDN" | sed 's/\.*$//' | tr '[:upper:]' '[:lower:]')
 
 # UPKI(セコム)のCAを示すCAAの issuer-domain-name
 CA_DOMAIN="secomtrust.net"
 
 # シンボリックリンク経由の実行でも実体のあるディレクトリを指すよう解決する
-SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
-PSL_FILE="$SCRIPT_DIR/public_suffix_list.dat"
+# (テストから source された場合もこのファイルの場所を基準にするため、$0 ではなく BASH_SOURCE を使う)
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+# テストなどで別のリストを使えるよう、環境変数 CHECK_MPIC_PSL_FILE で差し替えられるようにする
+PSL_FILE="${CHECK_MPIC_PSL_FILE:-$SCRIPT_DIR/public_suffix_list.dat}"
 
-# Download PSL if not exists
-if [ ! -f "$PSL_FILE" ]; then
-    echo "Public Suffix List ($PSL_FILE) が見つかりません。ダウンロードします..."
-    curl -sS https://publicsuffix.org/list/public_suffix_list.dat -o "$PSL_FILE"
-    if [ $? -ne 0 ] || [ ! -s "$PSL_FILE" ]; then
-        echo "Public Suffix List のダウンロードに失敗しました。"
+# コマンドライン引数を解析し、TARGET_FQDN / TSV_FILE / QUIET を設定する
+parse_args() {
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -f|--tsv)
+                if [ -z "$2" ]; then
+                    usage
+                    exit 1
+                fi
+                TSV_FILE=$2
+                shift 2
+                ;;
+            -q|--quiet)
+                QUIET=1
+                shift
+                ;;
+            -h|--help)
+                usage
+                exit 0
+                ;;
+            -*)
+                echo "不明なオプションです: $1"
+                usage
+                exit 1
+                ;;
+            *)
+                if [ -n "$TARGET_FQDN" ]; then
+                    usage
+                    exit 1
+                fi
+                TARGET_FQDN=$1
+                shift
+                ;;
+        esac
+    done
+
+    # FQDNとTSVはどちらか一方だけを指定する
+    if [[ ( -n "$TSV_FILE" && -n "$TARGET_FQDN" ) || ( -z "$TSV_FILE" && -z "$TARGET_FQDN" ) ]]; then
+        usage
         exit 1
     fi
-fi
+    if [ -n "$TSV_FILE" ] && [ ! -r "$TSV_FILE" ]; then
+        echo "TSVファイル ($TSV_FILE) を読み込めません。"
+        exit 1
+    fi
+
+    # 入力FQDNを正規化する (末尾のドットを除き、小文字にそろえる。PSLとの照合は小文字で行うため)
+    TARGET_FQDN=$(echo "$TARGET_FQDN" | sed 's/\.*$//' | tr '[:upper:]' '[:lower:]')
+}
+
+# Public Suffix List がなければダウンロードする
+ensure_psl() {
+    if [ ! -f "$PSL_FILE" ]; then
+        echo "Public Suffix List ($PSL_FILE) が見つかりません。ダウンロードします..."
+        if ! curl -sS https://publicsuffix.org/list/public_suffix_list.dat -o "$PSL_FILE" || [ ! -s "$PSL_FILE" ]; then
+            echo "Public Suffix List のダウンロードに失敗しました。"
+            exit 1
+        fi
+    fi
+}
 
 # eTLD+1を判定する関数
 get_etld_plus_one() {
@@ -223,7 +230,7 @@ query_caa() {
     local name=$1
     local dns_opt=$2
     local answer
-    answer=$(dig CAA "$name" $dns_opt +time=3 +tries=2 +noall +answer | awk '$4 == "CAA" { owner = $1; $1 = $2 = $3 = $4 = ""; sub(/^ +/, ""); print owner "\t" $0 }')
+    answer=$(dig CAA "$name" ${dns_opt:+"$dns_opt"} +time=3 +tries=2 +noall +answer | awk '$4 == "CAA" { owner = $1; $1 = $2 = $3 = $4 = ""; sub(/^ +/, ""); print owner "\t" $0 }')
     if [ -z "$answer" ]; then
         echo "|"
         return
@@ -290,7 +297,8 @@ process_fqdn() {
     fi
 
     # 名前解決できるか確認 (タイムアウトを防ぐために +time=3 +tries=2 を付与)
-    local code=$(dig "$fqdn" $dns_opt +time=3 +tries=2 +noall +comments | grep -ioE "status: [A-Z]+" | awk '{print $2}' | tr '[:lower:]' '[:upper:]')
+    local code
+    code=$(dig "$fqdn" ${dns_opt:+"$dns_opt"} +time=3 +tries=2 +noall +comments | grep -ioE "status: [A-Z]+" | awk '{print $2}' | tr '[:lower:]' '[:upper:]')
     # NXDOMAIN と SERVFAIL は発行方式への影響が異なるため分けて説明する
     if [[ "$code" == "NXDOMAIN" ]]; then
         echo "名前解決ができません (status: NXDOMAIN)。"
@@ -319,11 +327,12 @@ process_fqdn() {
         # CAAの確認
         # CNAMEが張られている場合、CAAの問い合わせは参照先の結果を返すため、
         # このドメイン自身のCAAとしては表示せず、参照先の確認結果に任せる
-        local caa_res=$(query_caa "$current_fqdn" "$dns_opt")
+        local caa_res
+        caa_res=$(query_caa "$current_fqdn" "$dns_opt")
         local caa_owner=${caa_res%%|*}
         local caa_result=""
         if [ "$caa_owner" == "$(to_lower "$current_fqdn")" ]; then
-            caa_result=$(dig +short CAA "$current_fqdn" $dns_opt +time=3 +tries=2 | grep -E '^[0-9]+\s+')
+            caa_result=$(dig +short CAA "$current_fqdn" ${dns_opt:+"$dns_opt"} +time=3 +tries=2 | grep -E '^[0-9]+\s+')
         fi
         if [ -n "$caa_result" ]; then
             if [ $is_cname_target -eq 1 ]; then
@@ -334,7 +343,8 @@ process_fqdn() {
                 echo "$caa_result"
             fi
 
-            local caa_reason=$(caa_denial_reason "${caa_res#*|}")
+            local caa_reason
+            caa_reason=$(caa_denial_reason "${caa_res#*|}")
             if [ -n "$caa_reason" ]; then
                 echo "このCAAレコードでは $CA_DOMAIN による発行が許可されていません ($caa_reason)。(このドメイン単独でのCAA内容です。実際に発行へ影響するかはMPIC判定結果の実効CAAの確認をご参照ください)"
             fi
@@ -349,14 +359,17 @@ process_fqdn() {
         fi
 
         # CNAMEの確認
-        local cname_result=$(dig +short CNAME "$current_fqdn" $dns_opt +time=3 +tries=2)
+        local cname_result
+        cname_result=$(dig +short CNAME "$current_fqdn" ${dns_opt:+"$dns_opt"} +time=3 +tries=2)
         if [ -n "$cname_result" ]; then
-            local next_fqdn=$(echo "$cname_result" | head -n 1 | sed 's/\.$//')
+            local next_fqdn
+            next_fqdn=$(echo "$cname_result" | head -n 1 | sed 's/\.$//')
             echo "CNAMEレコード ($current_fqdn):"
             echo "$cname_result"
             
             # CNAMEループ検知 (大文字小文字を区別せずに比較)
-            local next_fqdn_lc=$(echo "$next_fqdn" | tr '[:upper:]' '[:lower:]')
+            local next_fqdn_lc
+            next_fqdn_lc=$(echo "$next_fqdn" | tr '[:upper:]' '[:lower:]')
             for visited in "${visited_fqdns[@]}"; do
                 if [ "$(echo "$visited" | tr '[:upper:]' '[:lower:]')" == "$next_fqdn_lc" ]; then
                     echo "CNAMEのループまたは重複を検知しました ($next_fqdn)。追跡を終了します。"
@@ -387,9 +400,12 @@ get_dns_info() {
     fi
 
     # タイムアウトを防ぐために +time=3 +tries=2 を付与
-    local status=$(dig "$fqdn" $dns_opt +time=3 +tries=2 +noall +comments | grep -ioE "status: [A-Z]+" | awk '{print $2}' | tr '[:lower:]' '[:upper:]')
-    local caa=$(dig +short CAA "$fqdn" $dns_opt +time=3 +tries=2 | grep -E '^[0-9]+\s+' | sort | tr '\n' ',' | sed 's/,$//')
-    local cname=$(dig +short CNAME "$fqdn" $dns_opt +time=3 +tries=2 | sort | tr '\n' ',' | sed 's/,$//')
+    local status
+    status=$(dig "$fqdn" ${dns_opt:+"$dns_opt"} +time=3 +tries=2 +noall +comments | grep -ioE "status: [A-Z]+" | awk '{print $2}' | tr '[:lower:]' '[:upper:]')
+    local caa
+    caa=$(dig +short CAA "$fqdn" ${dns_opt:+"$dns_opt"} +time=3 +tries=2 | grep -E '^[0-9]+\s+' | sort | tr '\n' ',' | sed 's/,$//')
+    local cname
+    cname=$(dig +short CNAME "$fqdn" ${dns_opt:+"$dns_opt"} +time=3 +tries=2 | sort | tr '\n' ',' | sed 's/,$//')
 
     if [ -z "$status" ]; then
         status="TIMEOUT_OR_ERROR"
@@ -408,33 +424,54 @@ evaluate_mpic() {
     echo "=================================================="
 
     # それぞれのDNSで情報を取得
-    local res_def=$(get_dns_info "$fqdn" "")
-    local stat_def=$(echo "$res_def" | cut -d'|' -f1)
-    local caa_def=$(echo "$res_def" | cut -d'|' -f2)
-    local cname_def=$(echo "$res_def" | cut -d'|' -f3)
+    local res_def
+    res_def=$(get_dns_info "$fqdn" "")
+    local stat_def
+    stat_def=$(echo "$res_def" | cut -d'|' -f1)
+    local caa_def
+    caa_def=$(echo "$res_def" | cut -d'|' -f2)
+    local cname_def
+    cname_def=$(echo "$res_def" | cut -d'|' -f3)
 
-    local res_8888=$(get_dns_info "$fqdn" "8.8.8.8")
-    local stat_8888=$(echo "$res_8888" | cut -d'|' -f1)
-    local caa_8888=$(echo "$res_8888" | cut -d'|' -f2)
-    local cname_8888=$(echo "$res_8888" | cut -d'|' -f3)
+    local res_8888
+    res_8888=$(get_dns_info "$fqdn" "8.8.8.8")
+    local stat_8888
+    stat_8888=$(echo "$res_8888" | cut -d'|' -f1)
+    local caa_8888
+    caa_8888=$(echo "$res_8888" | cut -d'|' -f2)
+    local cname_8888
+    cname_8888=$(echo "$res_8888" | cut -d'|' -f3)
 
-    local res_1111=$(get_dns_info "$fqdn" "1.1.1.1")
-    local stat_1111=$(echo "$res_1111" | cut -d'|' -f1)
-    local caa_1111=$(echo "$res_1111" | cut -d'|' -f2)
-    local cname_1111=$(echo "$res_1111" | cut -d'|' -f3)
+    local res_1111
+    res_1111=$(get_dns_info "$fqdn" "1.1.1.1")
+    local stat_1111
+    stat_1111=$(echo "$res_1111" | cut -d'|' -f1)
+    local caa_1111
+    caa_1111=$(echo "$res_1111" | cut -d'|' -f2)
+    local cname_1111
+    cname_1111=$(echo "$res_1111" | cut -d'|' -f3)
 
     # 親ドメインへの遡り(TLDまで)とCNAMEの参照先を考慮した「実効CAAレコード」を各DNS拠点ごとに取得
-    local rel_def=$(find_relevant_caa "$fqdn" "")
-    local rel_def_domain=$(echo "$rel_def" | cut -d'|' -f1)
-    local rel_def_caa=$(echo "$rel_def" | cut -d'|' -f2)
+    local rel_def
+    rel_def=$(find_relevant_caa "$fqdn" "")
+    local rel_def_domain
+    rel_def_domain=$(echo "$rel_def" | cut -d'|' -f1)
+    local rel_def_caa
+    rel_def_caa=$(echo "$rel_def" | cut -d'|' -f2)
 
-    local rel_8888=$(find_relevant_caa "$fqdn" "8.8.8.8")
-    local rel_8888_domain=$(echo "$rel_8888" | cut -d'|' -f1)
-    local rel_8888_caa=$(echo "$rel_8888" | cut -d'|' -f2)
+    local rel_8888
+    rel_8888=$(find_relevant_caa "$fqdn" "8.8.8.8")
+    local rel_8888_domain
+    rel_8888_domain=$(echo "$rel_8888" | cut -d'|' -f1)
+    local rel_8888_caa
+    rel_8888_caa=$(echo "$rel_8888" | cut -d'|' -f2)
 
-    local rel_1111=$(find_relevant_caa "$fqdn" "1.1.1.1")
-    local rel_1111_domain=$(echo "$rel_1111" | cut -d'|' -f1)
-    local rel_1111_caa=$(echo "$rel_1111" | cut -d'|' -f2)
+    local rel_1111
+    rel_1111=$(find_relevant_caa "$fqdn" "1.1.1.1")
+    local rel_1111_domain
+    rel_1111_domain=$(echo "$rel_1111" | cut -d'|' -f1)
+    local rel_1111_caa
+    rel_1111_caa=$(echo "$rel_1111" | cut -d'|' -f2)
 
     local mpic_pass=1
     # 発行方式ごとの見通し (1=問題なし / 2=条件付き / 0=発行できない)
@@ -865,28 +902,39 @@ print_tsv_summary() {
     echo "--------------------------------------------------"
 }
 
-if [ -n "$TSV_FILE" ]; then
-    echo "--> 申請TSV ($TSV_FILE) を読み込みます"
-    parse_tsv "$TSV_FILE"
-    if [ ${#ROW_LINES[@]} -eq 0 ]; then
-        echo "確認対象のホスト名がTSVに見つかりませんでした。"
-        exit 1
-    fi
+main() {
+    parse_args "$@"
+    ensure_psl
 
-    for (( r=0; r<${#ROW_LINES[@]}; r++ )); do
-        for host in ${ROW_HOSTS[r]}; do
-            run_check "$host" "行${ROW_LINES[r]}"
+    local r host
+    if [ -n "$TSV_FILE" ]; then
+        echo "--> 申請TSV ($TSV_FILE) を読み込みます"
+        parse_tsv "$TSV_FILE"
+        if [ ${#ROW_LINES[@]} -eq 0 ]; then
+            echo "確認対象のホスト名がTSVに見つかりませんでした。"
+            exit 1
+        fi
+
+        for (( r=0; r<${#ROW_LINES[@]}; r++ )); do
+            for host in ${ROW_HOSTS[r]}; do
+                run_check "$host" "行${ROW_LINES[r]}"
+            done
         done
-    done
 
-    print_tsv_summary
-else
-    if ! is_valid_hostname "$TARGET_FQDN"; then
-        echo "「${TARGET_FQDN}」はFQDNの形式ではありません。URLではなくホスト名だけを指定してください。(例: www.example.ac.jp)"
-        exit 1
+        print_tsv_summary
+    else
+        if ! is_valid_hostname "$TARGET_FQDN"; then
+            echo "「${TARGET_FQDN}」はFQDNの形式ではありません。URLではなくホスト名だけを指定してください。(例: www.example.ac.jp)"
+            exit 1
+        fi
+        run_check "$TARGET_FQDN" ""
+        if [ $QUIET -eq 1 ]; then
+            print_host_result "$TARGET_FQDN" ""
+        fi
     fi
-    run_check "$TARGET_FQDN" ""
-    if [ $QUIET -eq 1 ]; then
-        print_host_result "$TARGET_FQDN" ""
-    fi
+}
+
+# テストから source された場合は関数の定義だけを読み込み、実行はしない
+if [ "${BASH_SOURCE[0]}" == "$0" ]; then
+    main "$@"
 fi

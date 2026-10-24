@@ -1,0 +1,114 @@
+#!/bin/bash
+# desc: テスト用の模擬 dig コマンド。環境変数 MOCK_DNS_ZONE のゾーンファイルから応答を返す
+#
+# check_mpic.sh が使う次の呼び出し方だけに対応する
+#   dig <name> [@server] +noall +comments   … ステータス(NOERROR / NXDOMAIN / SERVFAIL)の確認
+#   dig +short <type> <name> [@server]      … レコードの値のみ
+#   dig <type> <name> [@server] +noall +answer … 所有者名付きの応答
+# +time / +tries などそれ以外のオプションは無視する
+#
+# ゾーンファイルの形式 (空白区切り、# 以降はコメント)
+#   <リゾルバ> <名前> <タイプ> <値...>
+#   - リゾルバは "*"(すべて) / "default"(@指定なし) / "8.8.8.8" などのサーバ名
+#   - ある名前についてリゾルバ固有の行があれば、その名前では "*" の行より優先する
+#   - タイプ STATUS は応答ステータスを上書きする (SERVFAIL / NXDOMAIN / TIMEOUT)
+#   - CNAME は問い合わせタイプが CNAME 以外ならたどる。名前自身か配下にレコードがなければ NXDOMAIN
+
+zone=${MOCK_DNS_ZONE:?MOCK_DNS_ZONE が設定されていません}
+
+short=0
+mode=""
+server="default"
+qtype="A"
+qname=""
+for arg in "$@"; do
+    case "$arg" in
+        +short) short=1 ;;
+        +answer) mode="answer" ;;
+        +comments) mode="comments" ;;
+        +*) ;;
+        @*) server=${arg#@} ;;
+        A|AAAA|CAA|CNAME|TXT|NS|SOA) qtype=$arg ;;
+        *) qname=$arg ;;
+    esac
+done
+qname=$(echo "${qname%.}" | tr '[:upper:]' '[:lower:]')
+
+# 指定したリゾルバから見た名前のレコードを "タイプ 値" の形で出力する
+records() {
+    awk -v res="$server" -v name="$1" '
+        /^[ \t]*(#|$)/ { next }
+        {
+            n = tolower($2)
+            sub(/\.$/, "", n)
+            if (n != name) next
+            v = $0
+            sub(/^[ \t]*[^ \t]+[ \t]+[^ \t]+[ \t]+/, "", v)
+            if ($1 == res) spec[++ns] = v
+            else if ($1 == "*") gen[++ng] = v
+        }
+        END {
+            if (ns > 0) { for (i = 1; i <= ns; i++) print spec[i] }
+            else { for (i = 1; i <= ng; i++) print gen[i] }
+        }' "$zone"
+}
+
+# 名前自身か配下に何らかのレコードがあれば存在するとみなす
+exists() {
+    awk -v res="$server" -v name="$1" '
+        /^[ \t]*(#|$)/ { next }
+        $1 != res && $1 != "*" { next }
+        $3 == "STATUS" { next }
+        {
+            n = tolower($2)
+            sub(/\.$/, "", n)
+            if (n == name || substr(n, length(n) - length(name)) == "." name) { found = 1; exit }
+        }
+        END { exit !found }' "$zone"
+}
+
+status="NOERROR"
+answers=""
+current=$qname
+for _ in 1 2 3 4 5 6 7 8; do
+    recs=$(records "$current")
+
+    st=$(echo "$recs" | awk '$1 == "STATUS" { print $2; exit }')
+    if [ -n "$st" ]; then
+        status=$st
+        break
+    fi
+
+    target=$(echo "$recs" | awk '$1 == "CNAME" { print $2; exit }')
+    if [ -n "$target" ] && [ "$qtype" != "CNAME" ]; then
+        target=$(echo "${target%.}" | tr '[:upper:]' '[:lower:]')
+        answers+="$current. 300 IN CNAME $target."$'\n'
+        current=$target
+        continue
+    fi
+
+    if ! exists "$current"; then
+        status="NXDOMAIN"
+        break
+    fi
+
+    while read -r value; do
+        [ -z "$value" ] && continue
+        [ "$qtype" == "CNAME" ] && value="${value%.}."
+        answers+="$current. 300 IN $qtype $value"$'\n'
+    done <<< "$(echo "$recs" | awk -v t="$qtype" '$1 == t { sub(/^[^ \t]+[ \t]+/, ""); print }')"
+    break
+done
+
+if [ "$status" == "TIMEOUT" ]; then
+    echo ";; connection timed out; no servers could be reached"
+    exit 9
+fi
+
+if [ $short -eq 1 ]; then
+    printf '%s' "$answers" | awk '{ $1 = $2 = $3 = $4 = ""; sub(/^ +/, ""); print }'
+elif [ "$mode" == "comments" ]; then
+    echo ";; ->>HEADER<<- opcode: QUERY, status: $status, id: 1"
+else
+    printf '%s' "$answers"
+fi

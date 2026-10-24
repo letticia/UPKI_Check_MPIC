@@ -1,5 +1,7 @@
 # check_mpic.sh スクリプトマニュアル
 
+[![test](https://github.com/letticia/UPKI_Check_MPIC/actions/workflows/test.yml/badge.svg)](https://github.com/letticia/UPKI_Check_MPIC/actions/workflows/test.yml)
+
 ## 概要
 `check_mpic.sh` は、指定されたFQDN（完全修飾ドメイン名）に対して、証明書発行に必要となる **CAAレコード** と関連する **CNAMEレコード** の設定状況をDNSを遡りながら確認し、さらに複数のパブリックDNSからの名前解決結果を照合することで **MPIC (Multi-Perspective Issuance Corroboration)** の要件を満たしているかを自動的にチェックするシェルスクリプトです。
 
@@ -149,6 +151,7 @@ CSRフローで「機関ドメインを一度確認して1年使い回す」運�
 ### Public Suffix List (PSL) について
 ドメインは単純に「最後のドットから数個」だけで頂点を判断することができません（例: `.com` は1つ前が頂点だが、`.co.jp` や `.ac.jp` は2つ前が頂点になるため）。
 本スクリプトは正確な判定を行うため、スクリプトと同じディレクトリに `public_suffix_list.dat` というリストファイルを要求します。存在しない場合は `curl` で自動的にダウンロードして使用します。
+環境変数 `CHECK_MPIC_PSL_FILE` にファイルのパスを指定すると、別の場所にあるリストを使えます（テストではこれで最小限のリストに差し替えています）。
 
 ---
 
@@ -299,3 +302,31 @@ CNAMEレコードがありません (certs.nii.ac.jp)
 ```
 
 エラーや警告が出た場合は、DNS側の設定（CAAレコードの追加修正やCNAMEの記述ミス）を見直してください。
+
+---
+
+## テスト
+
+`tests/run_tests.sh` で、関数の単体テストとスクリプト全体の結合テストを実行できます。
+本物の `dig` の代わりに模擬の `dig`（`tests/mock/dig`）を使うため、**ネットワークに接続せず**、いつでも同じ結果になります。
+
+```bash
+tests/run_tests.sh
+```
+
+| ファイル | 内容 |
+|---|---|
+| `tests/run_tests.sh` | テストの本体。失敗が1件でもあれば終了コード 1 を返す |
+| `tests/mock/dig` | 模擬の `dig`。`check_mpic.sh` が使う呼び出し方だけに対応し、ゾーンファイルから応答を返す |
+| `tests/fixtures/zone.txt` | 模擬DNSのゾーン。CAAの配置、CNAME、NXDOMAIN、DNS拠点ごとの応答の違い（SERVFAIL・タイムアウト・不一致）を定義 |
+| `tests/fixtures/public_suffix_list.dat` | テスト用の最小限の Public Suffix List |
+
+新しい判定ケースを追加するときは、`zone.txt` にレコードを足し、`run_tests.sh` に期待する判定を書きます。
+ゾーンファイルの書式は `tests/mock/dig` の冒頭のコメントを参照してください。
+
+`check_mpic.sh` は `source` しても実行されない（関数の定義だけが読み込まれる）ため、テストから個々の関数を直接呼び出せます。
+
+### CI
+GitHub Actions（`.github/workflows/test.yml`）で、プッシュとプルリクエストのたびに次を実行します。
+- `shellcheck -x` による静的解析
+- macOS（標準の bash 3.2・BSD awk）と Ubuntu（bash 5・mawk）でのテスト
