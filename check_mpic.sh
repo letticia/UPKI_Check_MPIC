@@ -62,6 +62,12 @@ if [ -n "$TSV_FILE" ] && [ ! -r "$TSV_FILE" ]; then
     exit 1
 fi
 
+# 入力FQDNを正規化する (末尾のドットを除き、小文字にそろえる。PSLとの照合は小文字で行うため)
+TARGET_FQDN=$(echo "$TARGET_FQDN" | sed 's/\.*$//' | tr '[:upper:]' '[:lower:]')
+
+# UPKI(セコム)のCAを示すCAAの issuer-domain-name
+CA_DOMAIN="secomtrust.net"
+
 # シンボリックリンク経由の実行でも実体のあるディレクトリを指すよう解決する
 SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
 PSL_FILE="$SCRIPT_DIR/public_suffix_list.dat"
@@ -149,63 +155,125 @@ get_etld_plus_one() {
     fi
 }
 
-# CAAの検索アルゴリズム(RFC 8659)に沿って、CNAME追跡とeTLD+1までの親ドメイン遡りを行い、
-# 実際に発行可否を左右する「実効CAAレコード」を1件だけ探索するヘルパー関数。
-# あるドメインで空でないCAAレコードセットが見つかった時点でそこが実効CAAとなり、
-# それより上位ドメインのCAAは無視される(見つからなければCNAME先→親ドメインの順に遡る)。
+# CAAレコードセットが CA_DOMAIN による(ワイルドカードでない)証明書の発行を許可しているかを RFC 8659 に沿って判定する。
+# 引数: CAAレコードの内容をカンマで連結したもの (例: 0 issue "secomtrust.net",0 iodef "mailto:sec@example.ac.jp")
+# 出力: 許可されていれば空、許可されていなければその理由
+# - critical フラグ(128)付きの未知のタグがあれば、CAは発行してはならない
+# - issue タグが1つもなければ発行は制限されない
+#   (issuewild はワイルドカード証明書にのみ効き、iodef は違反の報告先で、いずれも発行の許可とは無関係)
+# - issue タグがあれば、その値の issuer-domain-name(「;」より前)が CA_DOMAIN と一致するものが必要。
+#   issue ";" はどのCAにも発行を許可しない
+# - タグ名とドメイン名は大文字小文字を区別しない
+# ※ UPKIではワイルドカード証明書を申請できないため issuewild は判定に使わない
+# ※ issue の値に続く RFC 8657 のパラメータ(accounturi / validationmethods)は判定していない
+caa_denial_reason() {
+    echo "$1" | awk -v ca="$CA_DOMAIN" '
+    {
+        line = $0
+        # レコードの区切りのカンマ(直後が「フラグ タグ」で始まるもの)だけを改行に置き換えて分割する
+        gsub(/,[0-9]+[ \t]+[A-Za-z0-9]+[ \t]+/, "\n&", line)
+        n = split(line, recs, "\n")
+        for (i = 1; i <= n; i++) {
+            r = recs[i]
+            sub(/^,/, "", r)
+            if (r !~ /^[0-9]+[ \t]+[A-Za-z0-9]+/) continue
+            flags = r
+            sub(/[ \t].*/, "", flags)
+            rest = r
+            sub(/^[0-9]+[ \t]+/, "", rest)
+            tag = rest
+            sub(/[ \t].*/, "", tag)
+            tag = tolower(tag)
+            value = rest
+            sub(/^[A-Za-z0-9]+[ \t]*/, "", value)
+            gsub(/^"|"$/, "", value)
+
+            if (tag != "issue" && tag != "issuewild" && tag != "iodef" && tag != "contactemail" && tag != "contactphone") {
+                if (int(flags / 128) % 2 == 1 && critical == "") critical = tag
+                continue
+            }
+            if (tag != "issue") continue
+
+            has_issue = 1
+            d = value
+            sub(/;.*/, "", d)
+            gsub(/[ \t]/, "", d)
+            d = tolower(d)
+            if (d == ca) permitted = 1
+            if (d != "") issuers = (issuers == "" ? d : issuers ", " d)
+        }
+    }
+    END {
+        if (critical != "") {
+            print "criticalフラグ付きの未知のタグ(" critical ")があるため、どのCAも発行できません"
+        } else if (has_issue && !permitted) {
+            if (issuers == "") {
+                print "issue \";\" によりすべてのCAの発行が禁止されています"
+            } else {
+                print "issueで許可されているCA(" issuers ")に " ca " が含まれません"
+            }
+        }
+    }'
+}
+
+# CAAレコードセットを取得するヘルパー関数。
+# CAAの問い合わせではリゾルバがCNAMEをたどるため、実際にCAAが置かれているドメイン(CNAMEの参照先)もあわせて返す。
+# 出力形式: "CAAが置かれているドメイン名(小文字)|CAAレコードの内容(ソートしてカンマ区切り)" (見つからない場合は "|")
+query_caa() {
+    local name=$1
+    local dns_opt=$2
+    local answer
+    answer=$(dig CAA "$name" $dns_opt +time=3 +tries=2 +noall +answer | awk '$4 == "CAA" { owner = $1; $1 = $2 = $3 = $4 = ""; sub(/^ +/, ""); print owner "\t" $0 }')
+    if [ -z "$answer" ]; then
+        echo "|"
+        return
+    fi
+    local owner caa
+    owner=$(echo "$answer" | head -n 1 | cut -f1 | sed 's/\.$//' | tr '[:upper:]' '[:lower:]')
+    caa=$(echo "$answer" | cut -f2- | sort | tr '\n' ',' | sed 's/,$//')
+    echo "$owner|$caa"
+}
+
+# CAAの検索アルゴリズム(RFC 8659 3節)に沿って、実際に発行可否を左右する「実効CAAレコード」を1件だけ探索するヘルパー関数。
+# 対象FQDNからラベルを1つずつ削って親ドメインへ遡り、空でないCAAレコードセットが最初に見つかったものを採用する
+# (見つかった時点で、それより上位ドメインのCAAは無視される)。
+# - 各ドメインのCAAの問い合わせではCNAMEがたどられるため、CNAMEの参照先に置かれたCAAも対象になる
+# - ただし見つからなかったときに遡るのは「元のドメインの親」であり、CNAMEの参照先の親ドメインは探さない
+#   (参照先の親まで遡るのは旧仕様 RFC 6844 の動作で、RFC 8659 で廃止された)
+# - 遡りはDNSルートの直前(TLD)まで行う
 # 出力形式: "CAAが見つかったドメイン名|CAAレコードの内容" (見つからない場合は "|")
+#   CNAMEの参照先で見つかった場合のドメイン名は "対象ドメイン(CNAME先: 参照先ドメイン)" とする
 find_relevant_caa() {
     local fqdn=$1
     local dns=$2
-    local psl=$3
     local dns_opt=""
 
     if [ -n "$dns" ]; then
         dns_opt="@$dns"
     fi
 
-    local current="$fqdn"
-    local visited=()
-
-    while true; do
-        local current_lc
-        current_lc=$(echo "$current" | tr '[:upper:]' '[:lower:]')
-
-        local v
-        for v in "${visited[@]}"; do
-            if [ "$v" == "$current_lc" ]; then
-                echo "|"
-                return
-            fi
-        done
-        visited+=("$current_lc")
-
-        # CNAMEがあれば参照先を正としてCAAを確認する
-        # (CNAMEの張られたノードには本来他のレコードは実在せず、dig CAAも自動的にCNAME先の
-        #  結果を返してしまうため、表示ドメイン名を正しくするために先にCNAMEを確認する)
-        local cname
-        cname=$(dig +short CNAME "$current" $dns_opt +time=3 +tries=2 | head -n 1 | sed 's/\.$//')
-        if [ -n "$cname" ]; then
-            current="$cname"
-            continue
-        fi
-
-        local caa
-        caa=$(dig +short CAA "$current" $dns_opt +time=3 +tries=2 | grep -E '^[0-9]+\s+' | sort | tr '\n' ',' | sed 's/,$//')
+    local current=$fqdn
+    local res owner caa
+    while [ -n "$current" ]; do
+        res=$(query_caa "$current" "$dns_opt")
+        owner=${res%%|*}
+        caa=${res#*|}
         if [ -n "$caa" ]; then
-            echo "$current|$caa"
+            if [ "$owner" != "$(to_lower "$current")" ]; then
+                echo "$current(CNAME先: $owner)|$caa"
+            else
+                echo "$current|$caa"
+            fi
             return
         fi
 
-        # CAAもCNAMEも無ければ、eTLD+1に到達するまで親ドメインへ遡る
-        local etld1
-        etld1=$(get_etld_plus_one "$current" "$psl")
-        if [ "$current" == "$etld1" ] || [[ "$current" != *"."* ]]; then
-            echo "|"
-            return
+        # ドットが含まれていなければTLDまで確認したので終了
+        if [[ "$current" != *"."* ]]; then
+            break
         fi
-        current=$(echo "$current" | cut -d'.' -f2-)
+        current=${current#*.}
     done
+    echo "|"
 }
 
 # FQDNの確認処理本体
@@ -249,7 +317,14 @@ process_fqdn() {
 
     while true; do
         # CAAの確認
-        local caa_result=$(dig +short CAA "$current_fqdn" $dns_opt +time=3 +tries=2 | grep -E '^[0-9]+\s+')
+        # CNAMEが張られている場合、CAAの問い合わせは参照先の結果を返すため、
+        # このドメイン自身のCAAとしては表示せず、参照先の確認結果に任せる
+        local caa_res=$(query_caa "$current_fqdn" "$dns_opt")
+        local caa_owner=${caa_res%%|*}
+        local caa_result=""
+        if [ "$caa_owner" == "$(to_lower "$current_fqdn")" ]; then
+            caa_result=$(dig +short CAA "$current_fqdn" $dns_opt +time=3 +tries=2 | grep -E '^[0-9]+\s+')
+        fi
         if [ -n "$caa_result" ]; then
             if [ $is_cname_target -eq 1 ]; then
                 echo "CNAME先のCAAレコード ($current_fqdn):"
@@ -258,10 +333,13 @@ process_fqdn() {
                 echo "CAAレコード ($current_fqdn):"
                 echo "$caa_result"
             fi
-            
-            if ! echo "$caa_result" | grep -iq "secomtrust\.net"; then
-                echo "CAAレコードが存在しますが、 secomtrust.net が含まれません。(このドメイン単独でのCAA内容です。実際に発行へ影響するかはMPIC判定結果の実効CAAの確認をご参照ください)"
+
+            local caa_reason=$(caa_denial_reason "${caa_res#*|}")
+            if [ -n "$caa_reason" ]; then
+                echo "このCAAレコードでは $CA_DOMAIN による発行が許可されていません ($caa_reason)。(このドメイン単独でのCAA内容です。実際に発行へ影響するかはMPIC判定結果の実効CAAの確認をご参照ください)"
             fi
+        elif [ -n "$caa_owner" ]; then
+            echo "CAAレコードはCNAMEの先 ($caa_owner) にあります ($current_fqdn)"
         else
             if [ $is_cname_target -eq 1 ]; then
                 echo "CNAMEレコードの先のCAAレコードがありません ($current_fqdn)"
@@ -345,16 +423,16 @@ evaluate_mpic() {
     local caa_1111=$(echo "$res_1111" | cut -d'|' -f2)
     local cname_1111=$(echo "$res_1111" | cut -d'|' -f3)
 
-    # CNAME追跡・eTLD+1までの親ドメイン遡りを考慮した「実効CAAレコード」を各DNS拠点ごとに取得
-    local rel_def=$(find_relevant_caa "$fqdn" "" "$PSL_FILE")
+    # 親ドメインへの遡り(TLDまで)とCNAMEの参照先を考慮した「実効CAAレコード」を各DNS拠点ごとに取得
+    local rel_def=$(find_relevant_caa "$fqdn" "")
     local rel_def_domain=$(echo "$rel_def" | cut -d'|' -f1)
     local rel_def_caa=$(echo "$rel_def" | cut -d'|' -f2)
 
-    local rel_8888=$(find_relevant_caa "$fqdn" "8.8.8.8" "$PSL_FILE")
+    local rel_8888=$(find_relevant_caa "$fqdn" "8.8.8.8")
     local rel_8888_domain=$(echo "$rel_8888" | cut -d'|' -f1)
     local rel_8888_caa=$(echo "$rel_8888" | cut -d'|' -f2)
 
-    local rel_1111=$(find_relevant_caa "$fqdn" "1.1.1.1" "$PSL_FILE")
+    local rel_1111=$(find_relevant_caa "$fqdn" "1.1.1.1")
     local rel_1111_domain=$(echo "$rel_1111" | cut -d'|' -f1)
     local rel_1111_caa=$(echo "$rel_1111" | cut -d'|' -f2)
 
@@ -435,32 +513,34 @@ evaluate_mpic() {
         fi
     fi
 
-    # 4. 実効CAAレコード(CNAME追跡・eTLD+1までの親ドメイン遡りの末に最初に見つかったCAA)による許可確認
+    # 4. 実効CAAレコード(親ドメインへの遡りの末に最初に見つかったCAA。CNAMEの参照先を含む)による許可確認
     #    ※ CAA(RFC 8659)はDCVとは別レイヤの「どのCAが発行してよいか」の許可リストであり、
     #      上位ドメインへ遡って探すのは仕様どおりの正常動作(NXDOMAINは障害にならない)。方式によらず発行を左右する。
     #    ※ 対象ドメイン自身に空でないCAAが見つかればそこで探索を打ち切るため、
     #      無関係な上位ドメインのCAAレコードが誤って判定に影響することはない
     #    ※ 3拠点で同じ実効CAAが得られた場合は、同じ指摘を3回繰り返さず1件にまとめる
     local caa_ng=0
+    local rel_labels rel_domains rel_caas suffix i reason
     if [ "$rel_def" == "$rel_8888" ] && [ "$rel_8888" == "$rel_1111" ]; then
-        if [ -n "$rel_def_domain" ] && ! echo "$rel_def_caa" | grep -iq "secomtrust\.net"; then
-            caa_ng=1
-            fail_reasons+=("・実効的に適用されるCAAレコード ($rel_def_domain: $rel_def_caa) に secomtrust.net が含まれません。(全DNS拠点で共通)")
-        fi
+        rel_labels=("")
+        rel_domains=("$rel_def_domain")
+        rel_caas=("$rel_def_caa")
+        suffix="(全DNS拠点で共通)"
     else
-        if [ -n "$rel_def_domain" ] && ! echo "$rel_def_caa" | grep -iq "secomtrust\.net"; then
-            caa_ng=1
-            fail_reasons+=("・デフォルトDNSで実効的に適用されるCAAレコード ($rel_def_domain: $rel_def_caa) に secomtrust.net が含まれません。")
-        fi
-        if [ -n "$rel_8888_domain" ] && ! echo "$rel_8888_caa" | grep -iq "secomtrust\.net"; then
-            caa_ng=1
-            fail_reasons+=("・8.8.8.8で実効的に適用されるCAAレコード ($rel_8888_domain: $rel_8888_caa) に secomtrust.net が含まれません。")
-        fi
-        if [ -n "$rel_1111_domain" ] && ! echo "$rel_1111_caa" | grep -iq "secomtrust\.net"; then
-            caa_ng=1
-            fail_reasons+=("・1.1.1.1で実効的に適用されるCAAレコード ($rel_1111_domain: $rel_1111_caa) に secomtrust.net が含まれません。")
-        fi
+        rel_labels=("デフォルトDNSで" "8.8.8.8で" "1.1.1.1で")
+        rel_domains=("$rel_def_domain" "$rel_8888_domain" "$rel_1111_domain")
+        rel_caas=("$rel_def_caa" "$rel_8888_caa" "$rel_1111_caa")
+        suffix=""
     fi
+    for (( i=0; i<${#rel_labels[@]}; i++ )); do
+        [ -z "${rel_domains[i]}" ] && continue
+        reason=$(caa_denial_reason "${rel_caas[i]}")
+        if [ -n "$reason" ]; then
+            caa_ng=1
+            fail_reasons+=("・${rel_labels[i]}実効的に適用されるCAAレコード (${rel_domains[i]}: ${rel_caas[i]}) では $CA_DOMAIN による発行が許可されていません。$suffix")
+            fail_reasons+=("  [理由] $reason")
+        fi
+    done
     if [ $caa_ng -eq 1 ]; then
         mpic_pass=0
         csr_state=0
@@ -614,7 +694,7 @@ parse_tsv() {
         local hosts=()
         if [ -n "$col11" ]; then
             if is_valid_hostname "$col11"; then
-                hosts+=("$col11")
+                hosts+=("$(to_lower "$col11")")
             else
                 echo "行$lineno: 利用管理者FQDN(11列目)「${col11}」はホスト名の形式ではないため確認対象から除外します。"
             fi
@@ -647,7 +727,7 @@ parse_tsv() {
                         break
                     fi
                 done
-                [ $dup -eq 0 ] && hosts+=("$host")
+                [ $dup -eq 0 ] && hosts+=("$(to_lower "$host")")
             done
             if [ $count -gt 8 ]; then
                 echo "行$lineno: dNSNameは8個までです(現在${count}個)。UPKIでは申請エラーになります。"
@@ -801,6 +881,10 @@ if [ -n "$TSV_FILE" ]; then
 
     print_tsv_summary
 else
+    if ! is_valid_hostname "$TARGET_FQDN"; then
+        echo "「${TARGET_FQDN}」はFQDNの形式ではありません。URLではなくホスト名だけを指定してください。(例: www.example.ac.jp)"
+        exit 1
+    fi
     run_check "$TARGET_FQDN" ""
     if [ $QUIET -eq 1 ]; then
         print_host_result "$TARGET_FQDN" ""
