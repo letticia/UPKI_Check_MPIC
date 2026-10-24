@@ -1,0 +1,61 @@
+# テスト用の模擬DNSゾーン (tests/mock/dig が読む)
+# 形式: <リゾルバ> <名前> <タイプ> <値...>   リゾルバ "*" はすべて、"default" は @指定なし
+
+# --- 正常系 ---
+# 親ドメインのCAAが secomtrust.net を許可
+*  ok.alpha.ac.jp  A  192.0.2.1
+*  www.alpha.ac.jp  A  192.0.2.2
+*  alpha.ac.jp  CAA  0 issue "secomtrust.net"
+# CAAがどこにもない
+*  plain.hotel.ac.jp  A  192.0.2.3
+
+# --- 親ドメインのCAA ---
+# 親ドメインのCAAが別のCAだけを許可 → 不可
+*  www.bravo.ac.jp  A  192.0.2.4
+*  bravo.ac.jp  CAA  0 issue "letsencrypt.org"
+# 自身のCAAが許可していれば、親ドメインの制限的なCAAは無視される → 可
+*  own.bravo.ac.jp  A  192.0.2.5
+*  own.bravo.ac.jp  CAA  0 issue "secomtrust.net"
+
+# --- CAAのタグ解析 (A1) ---
+# iodef にだけ secomtrust.net がある → 不可
+*  iodef.charlie.ac.jp  A  192.0.2.6
+*  iodef.charlie.ac.jp  CAA  0 iodef "mailto:sec@secomtrust.net"
+*  iodef.charlie.ac.jp  CAA  0 issue "letsencrypt.org"
+# issuewild にだけ secomtrust.net がある → 不可
+*  wild.charlie.ac.jp  A  192.0.2.7
+*  wild.charlie.ac.jp  CAA  0 issue "letsencrypt.org"
+*  wild.charlie.ac.jp  CAA  0 issuewild "secomtrust.net"
+
+# --- CNAMEと親ドメインへの遡り (A2) ---
+# CNAME先の親(cdn-delta.net)は許可しているが、元のドメインの親(delta.ac.jp)が不許可 → 不可
+*  www.delta.ac.jp  CNAME  edge.cdn-delta.net
+*  edge.cdn-delta.net  A  198.51.100.1
+*  cdn-delta.net  CAA  0 issue "secomtrust.net"
+*  delta.ac.jp  CAA  0 issue "letsencrypt.org"
+# CNAME先自身のCAAが不許可 → 不可 (CNAME先: と表示される)
+*  www.foxtrot.ac.jp  CNAME  foxtrot-host.net
+*  foxtrot-host.net  A  198.51.100.2
+*  foxtrot-host.net  CAA  0 issue "letsencrypt.org"
+# CNAME先自身のCAAが許可 → 可
+*  www.echo.ac.jp  CNAME  echo-host.net
+*  echo-host.net  A  198.51.100.3
+*  echo-host.net  CAA  0 issue "secomtrust.net"
+
+# --- 名前解決の失敗とDNS拠点間の不一致 ---
+# missing.alpha.ac.jp はレコードがないため NXDOMAIN
+# 8.8.8.8 でのみ SERVFAIL (海外からのアクセス制限を想定)
+*  geo.alpha.ac.jp  A  192.0.2.8
+8.8.8.8  geo.alpha.ac.jp  STATUS  SERVFAIL
+# 1.1.1.1 でのみタイムアウト
+*  slow.alpha.ac.jp  A  192.0.2.9
+1.1.1.1  slow.alpha.ac.jp  STATUS  TIMEOUT
+# 1.1.1.1 でのみ CAA の内容が異なる
+*  split.alpha.ac.jp  A  192.0.2.10
+*  split.alpha.ac.jp  CAA  0 issue "secomtrust.net"
+1.1.1.1  split.alpha.ac.jp  A  192.0.2.10
+1.1.1.1  split.alpha.ac.jp  CAA  0 issue "letsencrypt.org"
+# 内部DNSでのみ解決できる (スプリットホライズン)
+default  internal.alpha.ac.jp  A  10.0.0.1
+8.8.8.8  internal.alpha.ac.jp  STATUS  NXDOMAIN
+1.1.1.1  internal.alpha.ac.jp  STATUS  NXDOMAIN
