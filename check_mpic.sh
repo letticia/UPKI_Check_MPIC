@@ -198,7 +198,7 @@ process_fqdn() {
 
     while true; do
         # CAAの確認
-        local caa_result=$(dig +short CAA "$current_fqdn" $dns_opt | grep -E '^[0-9]+\s+')
+        local caa_result=$(dig +short CAA "$current_fqdn" $dns_opt +time=3 +tries=2 | grep -E '^[0-9]+\s+')
         if [ -n "$caa_result" ]; then
             if [ $is_cname_target -eq 1 ]; then
                 echo "CNAME先のCAAレコード ($current_fqdn):"
@@ -220,7 +220,7 @@ process_fqdn() {
         fi
 
         # CNAMEの確認
-        local cname_result=$(dig +short CNAME "$current_fqdn" $dns_opt)
+        local cname_result=$(dig +short CNAME "$current_fqdn" $dns_opt +time=3 +tries=2)
         if [ -n "$cname_result" ]; then
             local next_fqdn=$(echo "$cname_result" | head -n 1 | sed 's/\.$//')
             echo "CNAMEレコード ($current_fqdn):"
