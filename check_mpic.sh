@@ -5,12 +5,63 @@
 # https://opensource.org/licenses/MIT
 #
 
-if [ -z "$1" ]; then
-    echo "使用法: $0 <FQDN>"
+usage() {
+    echo "使用法: $0 [-q] <FQDN>"
+    echo "        $0 [-q] -f <申請TSVファイル>"
+    echo ""
+    echo "  -f, --tsv FILE  UPKIの申請TSV(サーバ証明書 発行/更新、ACME利用情報 作成/更新)を読み込み、"
+    echo "                  利用管理者FQDN(11列目)とdNSName(13列目)のホスト名をすべて確認します"
+    echo "  -q, --quiet     個別の確認ログを省略し、判定のまとめだけを表示します"
+    echo "  -h, --help      この使い方を表示します"
+}
+
+TARGET_FQDN=""
+TSV_FILE=""
+QUIET=0
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -f|--tsv)
+            if [ -z "$2" ]; then
+                usage
+                exit 1
+            fi
+            TSV_FILE=$2
+            shift 2
+            ;;
+        -q|--quiet)
+            QUIET=1
+            shift
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        -*)
+            echo "不明なオプションです: $1"
+            usage
+            exit 1
+            ;;
+        *)
+            if [ -n "$TARGET_FQDN" ]; then
+                usage
+                exit 1
+            fi
+            TARGET_FQDN=$1
+            shift
+            ;;
+    esac
+done
+
+# FQDNとTSVはどちらか一方だけを指定する
+if [[ ( -n "$TSV_FILE" && -n "$TARGET_FQDN" ) || ( -z "$TSV_FILE" && -z "$TARGET_FQDN" ) ]]; then
+    usage
+    exit 1
+fi
+if [ -n "$TSV_FILE" ] && [ ! -r "$TSV_FILE" ]; then
+    echo "TSVファイル ($TSV_FILE) を読み込めません。"
     exit 1
 fi
 
-TARGET_FQDN=$1
 # シンボリックリンク経由の実行でも実体のあるディレクトリを指すよう解決する
 SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
 PSL_FILE="$SCRIPT_DIR/public_suffix_list.dat"
@@ -419,6 +470,14 @@ evaluate_mpic() {
         fail_reasons+=("  [ACME発行の場合] チャレンジ検証に成功しても、finalize時のCAA確認で拒否され発行できません。")
     fi
 
+    # 呼び出し元(まとめ表示)で使うため、判定結果をグローバル変数にも残す
+    MPIC_CSR_STATE=$csr_state
+    MPIC_ACME_STATE=$acme_state
+    MPIC_REASON=""
+    if [ ${#fail_reasons[@]} -gt 0 ]; then
+        MPIC_REASON=${fail_reasons[0]#・}
+    fi
+
     if [ $mpic_pass -eq 1 ]; then
         echo "判定結果: ✅ パスする可能性が高いです。"
         echo "複数のDNS拠点からの応答（ステータス、CAA、CNAME）が一致しています。"
@@ -463,53 +522,287 @@ evaluate_mpic() {
     fi
 }
 
-# eTLD+1を求める
-ETLD_PLUS_ONE=$(get_etld_plus_one "$TARGET_FQDN" "$PSL_FILE")
-echo "--> Public Suffix Listを元に算出された頂点ドメイン(eTLD+1): $ETLD_PLUS_ONE"
-echo ""
-echo "=================================================="
-echo "対象FQDNと上位ドメイン(デフォルトDNS)の確認"
-echo "=================================================="
-echo "※ ここで遡る上位ドメインは、CSR方式でDCVの対象となりうるADN(Authorization Domain Name)の候補でもあります。"
-echo ""
-
-current_domain=$TARGET_FQDN
-
-while true; do
-    process_fqdn "$current_domain" ""
-
-    if [ "$current_domain" == "$ETLD_PLUS_ONE" ]; then
-        echo ""
-        echo "--> 頂点ドメイン(eTLD+1: $current_domain) に到達しました。上位への遡りを終了します。"
-        break
-    fi
-
-    # ドットが含まれていない場合は最上位(TLD)まで来たので終了(安全装置)
-    if [[ "$current_domain" != *"."* ]]; then
-        break
-    fi
-
-    # 最初のドットまでを削って上位ドメインへ
-    next_domain=$(echo "$current_domain" | cut -d'.' -f2-)
-    if [ -z "$next_domain" ]; then
-        break
-    fi
-    current_domain=$next_domain
+# 1件のFQDNについて、上位ドメインへの遡り・パブリックDNSでの確認・MPIC判定を行う
+check_one_fqdn() {
+    local target=$1
+    local etld_plus_one
+    etld_plus_one=$(get_etld_plus_one "$target" "$PSL_FILE")
+    echo "--> Public Suffix Listを元に算出された頂点ドメイン(eTLD+1): $etld_plus_one"
     echo ""
-    echo "--- 上位FQDN ($current_domain) へ遡ります ---"
-done
+    echo "=================================================="
+    echo "対象FQDNと上位ドメイン(デフォルトDNS)の確認"
+    echo "=================================================="
+    echo "※ ここで遡る上位ドメインは、CSR方式でDCVの対象となりうるADN(Authorization Domain Name)の候補でもあります。"
+    echo ""
 
-echo ""
-echo "=================================================="
-echo "指定DNSでの確認 (8.8.8.8)"
-echo "=================================================="
-process_fqdn "$TARGET_FQDN" "8.8.8.8"
+    local current_domain=$target
+    local next_domain
 
-echo ""
-echo "=================================================="
-echo "指定DNSでの確認 (1.1.1.1)"
-echo "=================================================="
-process_fqdn "$TARGET_FQDN" "1.1.1.1"
+    while true; do
+        process_fqdn "$current_domain" ""
 
-# MPIC判定の実行
-evaluate_mpic "$TARGET_FQDN"
+        if [ "$current_domain" == "$etld_plus_one" ]; then
+            echo ""
+            echo "--> 頂点ドメイン(eTLD+1: $current_domain) に到達しました。上位への遡りを終了します。"
+            break
+        fi
+
+        # ドットが含まれていない場合は最上位(TLD)まで来たので終了(安全装置)
+        if [[ "$current_domain" != *"."* ]]; then
+            break
+        fi
+
+        # 最初のドットまでを削って上位ドメインへ
+        next_domain=$(echo "$current_domain" | cut -d'.' -f2-)
+        if [ -z "$next_domain" ]; then
+            break
+        fi
+        current_domain=$next_domain
+        echo ""
+        echo "--- 上位FQDN ($current_domain) へ遡ります ---"
+    done
+
+    echo ""
+    echo "=================================================="
+    echo "指定DNSでの確認 (8.8.8.8)"
+    echo "=================================================="
+    process_fqdn "$target" "8.8.8.8"
+
+    echo ""
+    echo "=================================================="
+    echo "指定DNSでの確認 (1.1.1.1)"
+    echo "=================================================="
+    process_fqdn "$target" "1.1.1.1"
+
+    # MPIC判定の実行
+    evaluate_mpic "$target"
+}
+
+# UPKIの申請TSVで使える形式のホスト名か (半角英数と「.」「-」のみ。ワイルドカードは不可)
+HOSTNAME_RE='^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)+$'
+is_valid_hostname() {
+    [[ "$1" =~ $HOSTNAME_RE ]]
+}
+
+to_lower() {
+    echo "$1" | tr '[:upper:]' '[:lower:]'
+}
+
+# 申請TSVを読み込み、申請行ごとの確認対象ホスト名を ROW_LINES / ROW_CNS / ROW_HOSTS に格納する
+# - サーバ証明書 発行/更新、ACME利用情報 作成/更新のTSVは、いずれも11列目が利用管理者FQDN、
+#   13列目がdNSName("dNSName=XXX,dNSName=ZZZ" 形式)。
+#   11列目のFQDNは13列目に書かれていなくてもUPKI側で自動付与されるため、両方を確認対象にする
+# - TSVはShift-JIS/CR+LFだが、使う列はASCIIのみで、Shift-JISの2バイト目にタブ(0x09)は現れないため
+#   文字コードを変換せずにバイト単位(LC_ALL=C)で分割できる
+# - 連続するタブで空の列が詰められないよう、read の区切りにはタブではなく「|」を使う
+ROW_LINES=()
+ROW_CNS=()
+ROW_HOSTS=()
+parse_tsv() {
+    local file=$1
+    local lineno col11 col13
+
+    while IFS='|' read -r lineno col11 col13; do
+        col11=${col11//[[:space:]]/}
+        col13=${col13//[[:space:]]/}
+
+        if [ -z "$col11" ] && [ -z "$col13" ]; then
+            echo "行$lineno: 利用管理者FQDN(11列目)・dNSName(13列目)が空のため対象外とします。(失効申請などの行)"
+            continue
+        fi
+
+        local hosts=()
+        if [ -n "$col11" ]; then
+            if is_valid_hostname "$col11"; then
+                hosts+=("$col11")
+            else
+                echo "行$lineno: 利用管理者FQDN(11列目)「${col11}」はホスト名の形式ではないため確認対象から除外します。"
+            fi
+        fi
+
+        if [ -n "$col13" ]; then
+            local items item host h dup
+            local count=0
+            if [[ "$col13" == *"," ]]; then
+                echo "行$lineno: dNSName(13列目)の末尾に「,」があります。UPKIでは申請エラーになります。"
+            fi
+            IFS=',' read -ra items <<< "$col13"
+            for item in "${items[@]}"; do
+                [ -z "$item" ] && continue
+                if [[ "$item" != dNSName=* ]]; then
+                    echo "行$lineno: dNSName(13列目)の要素「${item}」が「dNSName=ホスト名」の形式ではないため除外します。"
+                    continue
+                fi
+                host=${item#dNSName=}
+                if ! is_valid_hostname "$host"; then
+                    echo "行$lineno: dNSName(13列目)のホスト名「${host}」は使用できない形式のため除外します。(半角英数と「.」「-」のみ。ワイルドカード不可)"
+                    continue
+                fi
+                count=$((count + 1))
+                # 11列目と同じホスト名や行内の重複は1回だけ確認する
+                dup=0
+                for h in "${hosts[@]}"; do
+                    if [ "$(to_lower "$h")" == "$(to_lower "$host")" ]; then
+                        dup=1
+                        break
+                    fi
+                done
+                [ $dup -eq 0 ] && hosts+=("$host")
+            done
+            if [ $count -gt 8 ]; then
+                echo "行$lineno: dNSNameは8個までです(現在${count}個)。UPKIでは申請エラーになります。"
+            fi
+        fi
+
+        if [ ${#hosts[@]} -eq 0 ]; then
+            echo "行$lineno: 確認できるホスト名がないため対象外とします。"
+            continue
+        fi
+
+        ROW_LINES+=("$lineno")
+        ROW_CNS+=("$col11")
+        ROW_HOSTS+=("${hosts[*]}")
+    done < <(LC_ALL=C awk -F'\t' '{ sub(/\r$/, ""); if ($0 == "") next; print NR "|" $11 "|" $13 }' "$file")
+}
+
+# 確認済みFQDNの結果 (同じホスト名が複数行に出てきても1回だけ確認する。bash 3.2 互換のため連想配列は使わない)
+CHECKED_FQDNS=()
+CHECKED_CSR=()
+CHECKED_ACME=()
+CHECKED_REASON=()
+
+# 確認済みならその添字を、未確認なら空を出力する
+find_checked() {
+    local fqdn_lc i
+    fqdn_lc=$(to_lower "$1")
+    for (( i=0; i<${#CHECKED_FQDNS[@]}; i++ )); do
+        if [ "${CHECKED_FQDNS[i]}" == "$fqdn_lc" ]; then
+            echo "$i"
+            return
+        fi
+    done
+}
+
+# FQDNを1件確認して結果を記録する (確認済みなら何もしない)
+# -q 指定時は遡りやパブリックDNSでの個別表示を省き、判定だけを行う
+run_check() {
+    local fqdn=$1
+    local label=$2
+
+    [ -n "$(find_checked "$fqdn")" ] && return
+
+    if [ $QUIET -eq 1 ]; then
+        [ -n "$label" ] && echo "確認中: $fqdn" >&2
+        evaluate_mpic "$fqdn" > /dev/null
+    else
+        if [ -n "$label" ]; then
+            echo ""
+            echo "##################################################"
+            echo "# [$fqdn] ($label)"
+            echo "##################################################"
+        fi
+        check_one_fqdn "$fqdn"
+    fi
+
+    CHECKED_FQDNS+=("$(to_lower "$fqdn")")
+    CHECKED_CSR+=("$MPIC_CSR_STATE")
+    CHECKED_ACME+=("$MPIC_ACME_STATE")
+    CHECKED_REASON+=("$MPIC_REASON")
+}
+
+# 判定値(1=問題なし / 2=条件付き / 0=発行できない)を記号にする
+state_mark() {
+    case $1 in
+        1) echo "✅" ;;
+        2) echo "⚠️ " ;;
+        *) echo "❌" ;;
+    esac
+}
+
+# 2つの判定のうち悪いほうを返す (0=発行できない < 2=条件付き < 1=問題なし)
+worse_state() {
+    if [ "$1" == "0" ] || [ "$2" == "0" ]; then
+        echo 0
+    elif [ "$1" == "2" ] || [ "$2" == "2" ]; then
+        echo 2
+    else
+        echo 1
+    fi
+}
+
+# 確認済みFQDN1件分の結果を1行で表示する
+print_host_result() {
+    local fqdn=$1
+    local indent=$2
+    local idx
+    idx=$(find_checked "$fqdn")
+    local line
+    line=$(printf "%s%-40s CSR: %s  ACME: %s" "$indent" "$fqdn" "$(state_mark "${CHECKED_CSR[idx]}")" "$(state_mark "${CHECKED_ACME[idx]}")")
+    if [ -n "${CHECKED_REASON[idx]}" ]; then
+        line="$line  ← ${CHECKED_REASON[idx]}"
+    fi
+    echo "$line"
+}
+
+# 申請行ごとのまとめを表示する
+# 1枚の証明書(ACMEでは1回のorder)に含まれるホスト名が1つでも発行できなければ申請全体が失敗するため、
+# 行の判定は最も悪いホスト名の結果に合わせる
+print_tsv_summary() {
+    echo ""
+    echo "=================================================="
+    echo "【申請行ごとのまとめ】 ($TSV_FILE)"
+    echo "=================================================="
+
+    local r host idx
+    for (( r=0; r<${#ROW_LINES[@]}; r++ )); do
+        local row_csr=1
+        local row_acme=1
+        local n=0
+        for host in ${ROW_HOSTS[r]}; do
+            idx=$(find_checked "$host")
+            row_csr=$(worse_state "$row_csr" "${CHECKED_CSR[idx]}")
+            row_acme=$(worse_state "$row_acme" "${CHECKED_ACME[idx]}")
+            n=$((n + 1))
+        done
+
+        local cn=${ROW_CNS[r]}
+        [ -z "$cn" ] && cn="(利用管理者FQDN未記入)"
+        echo ""
+        echo "行${ROW_LINES[r]}  CN=$cn  (ホスト名${n}件)  CSR: $(state_mark "$row_csr")  ACME: $(state_mark "$row_acme")"
+        for host in ${ROW_HOSTS[r]}; do
+            print_host_result "$host" "    - "
+        done
+    done
+
+    echo ""
+    echo "--------------------------------------------------"
+    echo "※ 1枚の証明書(ACMEでは1回のorder)に含まれるホスト名が1つでも発行できない場合は申請全体が失敗するため、"
+    echo "  行の判定は最も悪いホスト名の結果に合わせています。"
+    echo "※ ⚠️  は、上位ADNでDCV済み(200日以内)かつCAAが適切であれば発行され得る状態です。"
+    if [ $QUIET -eq 1 ]; then
+        echo "※ 原因の詳細は -q を付けずに実行した個別の確認ログを参照してください。"
+    fi
+    echo "--------------------------------------------------"
+}
+
+if [ -n "$TSV_FILE" ]; then
+    echo "--> 申請TSV ($TSV_FILE) を読み込みます"
+    parse_tsv "$TSV_FILE"
+    if [ ${#ROW_LINES[@]} -eq 0 ]; then
+        echo "確認対象のホスト名がTSVに見つかりませんでした。"
+        exit 1
+    fi
+
+    for (( r=0; r<${#ROW_LINES[@]}; r++ )); do
+        for host in ${ROW_HOSTS[r]}; do
+            run_check "$host" "行${ROW_LINES[r]}"
+        done
+    done
+
+    print_tsv_summary
+else
+    run_check "$TARGET_FQDN" ""
+    if [ $QUIET -eq 1 ]; then
+        print_host_result "$TARGET_FQDN" ""
+    fi
+fi
