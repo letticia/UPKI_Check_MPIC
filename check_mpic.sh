@@ -12,6 +12,9 @@ usage() {
     echo "  -f, --tsv FILE  UPKIの申請TSV(サーバ証明書 発行/更新、ACME利用情報 作成/更新)を読み込み、"
     echo "                  利用管理者FQDN(11列目)とdNSName(13列目)のホスト名をすべて確認します"
     echo "  -q, --quiet     個別の確認ログを省略し、判定のまとめだけを表示します"
+    echo "  --acme-method METHOD"
+    echo "                  ACMEで使う検証方式 (dns-01 / http-01) を指定し、その方式で発行できるかを判定します"
+    echo "                  (指定しなければ、どちらかの方式で発行できればACMEを可とします。tls-alpn-01 はUPKIでは使えません)"
     echo "  --update-psl    Public Suffix List を取り直します (FQDNやTSVを指定しなければ、取り直すだけで終了します)"
     echo "                  (指定しなくても、${PSL_MAX_AGE_DAYS}日より古ければ自動で取り直します)"
     echo "  -h, --help      この使い方を表示します"
@@ -64,6 +67,11 @@ PSL_URL="https://publicsuffix.org/list/public_suffix_list.dat"
 PSL_MAX_AGE_DAYS=30
 UPDATE_PSL=0
 
+# UPKIのACMEで使える検証方式 (tls-alpn-01 は使えない)
+UPKI_ACME_METHODS="dns-01 http-01"
+# --acme-method で指定された方式 (空ならどちらでもよい)
+ACME_METHOD=""
+
 # コマンドライン引数を解析し、TARGET_FQDN / TSV_FILE / QUIET を設定する
 parse_args() {
     while [ $# -gt 0 ]; do
@@ -83,6 +91,23 @@ parse_args() {
             --update-psl)
                 UPDATE_PSL=1
                 shift
+                ;;
+            --acme-method)
+                case "$2" in
+                    dns-01|http-01)
+                        ACME_METHOD=$2
+                        ;;
+                    tls-alpn-01)
+                        echo "tls-alpn-01 はUPKIのACMEでは使えません。--acme-method には dns-01 か http-01 を指定してください。"
+                        exit $EXIT_ERROR
+                        ;;
+                    *)
+                        echo "--acme-method には dns-01 か http-01 を指定してください。"
+                        usage
+                        exit $EXIT_ERROR
+                        ;;
+                esac
+                shift 2
                 ;;
             -h|--help)
                 usage
@@ -310,23 +335,26 @@ caa_denial_reason() {
 # 引数: caa_denial_reason と同じ形式のCAAレコード (CA_DOMAIN による発行が許可されていることが前提)
 # 出力: "キー=値" の行
 #   has_params   CA_DOMAIN の issue レコードに accounturi / validationmethods が付いていれば 1
-#   acme_ok      ACMEの検証方式を許可する(validationmethods がないか、ACMEの方式を含む)レコードがあれば 1
-#   acme_methods ACMEで使える方式 (validationmethods のないレコードがあれば "all")
-#   acme_tbr_only ACMEの方式を ca-tbr-7 / 19 / 20 の形でしか許可していなければ 1
+#   acme_ok      UPKIのACMEで使える検証方式を許可する(validationmethods がないか、その方式を含む)レコードがあれば 1
+#   acme_methods ACMEで使える方式を validationmethods に書かれたとおりに並べたもの (validationmethods のないレコードがあれば "all")
+#   acme_allowed ACMEで使える方式を dns-01 / http-01 の名前で並べたもの (acme_methods の ca-tbr-N を言い換えたもの)
+#   acme_tbr_only ACMEの方式を ca-tbr-7 / 19 の形でしか許可していなければ 1
 #                 (BRは同じ方式を表すラベルのどれでも許可することを推奨(SHOULD)するにとどまるため)
 #   acme_acct    ACMEで使えるレコードがすべて accounturi 付きなら、その値 (なければ空)
 #   csr_ok       パラメータのないレコードがあれば 1 (CSR申請で使う方式やアカウントによらず許可される)
 #   params       パラメータの内容 (表示用)
 # - パラメータのない issue "secomtrust.net" はどのアカウント・方式でも許可するため、1つでもあれば制限はない
-# - ACMEの方式は IANA の登録名(dns-01 / http-01 / tls-alpn-01)と、同じ方式を表す BR の ca-tbr-7 / 19 / 20
+# - ACMEの方式は、UPKIのACMEで使える dns-01 / http-01 (IANA の登録名) と、同じ方式を表す BR の ca-tbr-7 / 19。
+#   tls-alpn-01 (ca-tbr-20) はUPKIのACMEで使えないため、これだけを許可するレコードはACMEを許可しないものとして扱う
 # - BR では小文字が正式な表記だが、CAが大文字小文字を区別しない照合をしてもよいため、ここでは区別しない
 # - UPKIのCSR申請でCAがどのBR 3.2.2.4の方式を使うか、ACME以外の accounturi をどう定めるかは不明なため、
 #   パラメータで制限されている場合のCSR申請は「要確認」とする
 caa_parameter_effects() {
     echo "$1" | awk -v ca="$CA_DOMAIN" '
     BEGIN {
-        acme["dns-01"] = 1; acme["http-01"] = 1; acme["tls-alpn-01"] = 1
-        acme["ca-tbr-7"] = 1; acme["ca-tbr-19"] = 1; acme["ca-tbr-20"] = 1
+        # UPKIのACMEで使える方式のラベル → dns-01 / http-01 の名前
+        acme["dns-01"] = "dns-01"; acme["ca-tbr-7"] = "dns-01"
+        acme["http-01"] = "http-01"; acme["ca-tbr-19"] = "http-01"
         all_acct = 1
     }
     {
@@ -370,11 +398,14 @@ caa_parameter_effects() {
             if (vm == "") {
                 rec_acme = 1
                 methods_all = 1
+                allowed["dns-01"] = 1
+                allowed["http-01"] = 1
             } else {
                 nl = split(vm, labels, ",")
                 for (m = 1; m <= nl; m++) {
                     if (labels[m] in acme) {
                         rec_acme = 1
+                        allowed[acme[labels[m]]] = 1
                         if (labels[m] !~ /^ca-tbr-/) iana = 1
                         if (!(labels[m] in seen)) {
                             seen[labels[m]] = 1
@@ -394,6 +425,10 @@ caa_parameter_effects() {
         print "has_params=" (has_params ? 1 : 0)
         print "acme_ok=" (acme_ok ? 1 : 0)
         print "acme_methods=" (methods_all ? "all" : methods)
+        canon = ""
+        if ("dns-01" in allowed) canon = "dns-01"
+        if ("http-01" in allowed) canon = (canon == "" ? "http-01" : canon ",http-01")
+        print "acme_allowed=" canon
         print "acme_tbr_only=" (acme_ok && !methods_all && !iana ? 1 : 0)
         print "acme_acct=" (acme_ok && all_acct ? accts : "")
         print "csr_ok=" (csr_ok ? 1 : 0)
@@ -732,6 +767,154 @@ print_auth_info() {
     done
 }
 
+# プライベートアドレスなど、インターネット上のCAから接続できないアドレスなら真を返す
+# IPv4: 0/8, 10/8, 100.64/10, 127/8, 169.254/16, 172.16/12, 192.168/16
+# IPv6: ::, ::1, fc00::/7 (ユニークローカル), fe80::/10 (リンクローカル)
+is_private_ip() {
+    echo "$1" | awk '
+        /:/ {
+            a = tolower($0)
+            if (a == "::" || a == "::1" || a ~ /^f[cd]/ || a ~ /^fe[89ab]/) exit 0
+            exit 1
+        }
+        {
+            split($0, o, ".")
+            o1 = o[1] + 0
+            o2 = o[2] + 0
+            if (o1 == 0 || o1 == 10 || o1 == 127) exit 0
+            if (o1 == 100 && o2 >= 64 && o2 <= 127) exit 0
+            if (o1 == 169 && o2 == 254) exit 0
+            if (o1 == 172 && o2 >= 16 && o2 <= 31) exit 0
+            if (o1 == 192 && o2 == 168) exit 0
+            exit 1
+        }'
+}
+
+# ACME向けの事前確認の結果 (表示と判定で同じFQDNを2回問い合わせないよう、最後に確認したFQDNの結果を保持する)
+ACME_FQDN=""
+ACME_CHAL_STATUS=""   # _acme-challenge.<FQDN> のステータス (パブリックDNSごと)
+ACME_CHAL_BAD=0       # _acme-challenge.<FQDN> の名前解決に失敗(SERVFAILなど)したら 1
+ACME_CHAL_CNAME=""    # _acme-challenge.<FQDN> のCNAMEの参照先 (dns-01 の委任)
+ACME_CHAL_DANGLING=0  # CNAMEの参照先が存在しない(NXDOMAIN)なら 1
+ACME_CHAL_TXT=""      # _acme-challenge.<FQDN> に残っているTXTレコード
+ACME_PUBLIC_ADDRS=""  # CAから接続できるアドレス (A / AAAA)
+ACME_PUBLIC_V6=""     # そのうちIPv6のアドレス
+ACME_PRIVATE_ADDRS="" # プライベートアドレスなど、CAから接続できないアドレス
+
+# UPKIのACMEで使える検証方式(dns-01 / http-01)が、DNSの面で使えるかを確かめるための情報を集める。
+# CAはインターネット上から確認するため、パブリックDNS (8.8.8.8 / 1.1.1.1) に問い合わせる。
+# - dns-01: _acme-challenge.<FQDN> が名前解決できること (TXTはACMEクライアントが検証のたびに設置するため、
+#   今はなくても(NXDOMAINでも)よい)。CNAMEで委任している場合は、参照先が存在することも確かめる
+# - http-01: FQDNに、CAが接続できるアドレス(A / AAAA)があること
+#   (CDNなどではDNSサーバーごとに違うアドレスを返すのが普通なので、アドレスはDNSサーバー間で比べず、両方の結果を合わせる)
+collect_acme_info() {
+    local fqdn=$1
+    [ "$ACME_FQDN" == "$fqdn" ] && return
+
+    ACME_FQDN=$fqdn
+    ACME_CHAL_STATUS=""
+    ACME_CHAL_BAD=0
+    ACME_CHAL_CNAME=""
+    ACME_CHAL_DANGLING=0
+    ACME_CHAL_TXT=""
+    ACME_PUBLIC_ADDRS=""
+    ACME_PUBLIC_V6=""
+    ACME_PRIVATE_ADDRS=""
+
+    local name="_acme-challenge.$fqdn"
+    local dns status first_status=""
+    for dns in 8.8.8.8 1.1.1.1; do
+        status=$(dig TXT "$name" "@$dns" +time=3 +tries=2 +noall +comments | grep -ioE "status: [A-Z]+" | awk '{print toupper($2)}')
+        [ -z "$status" ] && status="TIMEOUT_OR_ERROR"
+        [ -z "$first_status" ] && first_status=$status
+        ACME_CHAL_STATUS="${ACME_CHAL_STATUS:+$ACME_CHAL_STATUS, }$dns=$status"
+        if [ "$status" != "NOERROR" ] && [ "$status" != "NXDOMAIN" ]; then
+            ACME_CHAL_BAD=1
+        fi
+    done
+    ACME_CHAL_CNAME=$(dig +short CNAME "$name" @8.8.8.8 +time=3 +tries=2 | head -n 1 | sed 's/\.$//')
+    # CNAMEがあるのにTXTの問い合わせがNXDOMAINなら、参照先が存在しない
+    if [ -n "$ACME_CHAL_CNAME" ] && [ "$first_status" == "NXDOMAIN" ]; then
+        ACME_CHAL_DANGLING=1
+    fi
+    ACME_CHAL_TXT=$(dig +short TXT "$name" @8.8.8.8 +time=3 +tries=2 | grep '^"' | tr '\n' ',' | sed 's/,$//; s/,/, /g')
+
+    local addrs addr
+    addrs=$(for dns in 8.8.8.8 1.1.1.1; do
+        dig +short A "$fqdn" "@$dns" +time=3 +tries=2 | grep -E '^[0-9]+(\.[0-9]+){3}$'
+        dig +short AAAA "$fqdn" "@$dns" +time=3 +tries=2 | grep ':'
+    done | sort -u)
+    for addr in $addrs; do
+        if is_private_ip "$addr"; then
+            ACME_PRIVATE_ADDRS="${ACME_PRIVATE_ADDRS:+$ACME_PRIVATE_ADDRS, }$addr"
+        else
+            ACME_PUBLIC_ADDRS="${ACME_PUBLIC_ADDRS:+$ACME_PUBLIC_ADDRS, }$addr"
+            [[ "$addr" == *":"* ]] && ACME_PUBLIC_V6="${ACME_PUBLIC_V6:+$ACME_PUBLIC_V6, }$addr"
+        fi
+    done
+}
+
+# dns-01 で発行できない理由を出力する (発行できれば何も出力しない)
+acme_dns01_problem() {
+    if [ "$ACME_CHAL_BAD" == "1" ]; then
+        echo "_acme-challenge.$ACME_FQDN の名前解決に失敗しました ($ACME_CHAL_STATUS)"
+    fi
+}
+
+# http-01 で発行できない理由を出力する (発行できれば何も出力しない)
+acme_http01_problem() {
+    if [ -z "$ACME_PUBLIC_ADDRS" ] && [ -z "$ACME_PRIVATE_ADDRS" ]; then
+        echo "Aレコード・AAAAレコードがありません"
+    elif [ -z "$ACME_PUBLIC_ADDRS" ]; then
+        echo "アドレスがすべてプライベートアドレスのため、CAが接続できません ($ACME_PRIVATE_ADDRS)"
+    fi
+}
+
+# ACME向けの事前確認の結果を表示する
+print_acme_info() {
+    local fqdn=$1
+    collect_acme_info "$fqdn"
+
+    local problem
+    if [ -n "$ACME_METHOD" ]; then
+        echo "--acme-method で指定された検証方式: $ACME_METHOD"
+    fi
+    echo "--- dns-01 (_acme-challenge.$fqdn) ---"
+    echo "  status: $ACME_CHAL_STATUS"
+    echo "  CNAME: ${ACME_CHAL_CNAME:-(なし)}"
+    echo "  TXT: ${ACME_CHAL_TXT:-(なし)}"
+    if [ -n "$ACME_CHAL_TXT" ]; then
+        echo "  (残っているTXTレコードは検証の妨げにはなりません。ACMEクライアントが検証のたびに設置します)"
+    fi
+    problem=$(acme_dns01_problem)
+    if [ -n "$problem" ]; then
+        echo "  → 使えません: $problem"
+    elif [ "$ACME_CHAL_DANGLING" == "1" ]; then
+        echo "  → 注意: CNAMEの参照先 ($ACME_CHAL_CNAME) が存在しません"
+    else
+        echo "  → DNSの面では使えます"
+    fi
+
+    echo "--- http-01 (A / AAAA) ---"
+    echo "  CAが接続できるアドレス: ${ACME_PUBLIC_ADDRS:-(なし)}"
+    if [ -n "$ACME_PRIVATE_ADDRS" ]; then
+        echo "  プライベートアドレス: $ACME_PRIVATE_ADDRS"
+    fi
+    problem=$(acme_http01_problem)
+    if [ -n "$problem" ]; then
+        echo "  → 使えません: $problem"
+    else
+        echo "  → DNSの面では使えます (80番ポートへの実際の接続は確認していません)"
+        if [ -n "$ACME_PUBLIC_V6" ]; then
+            echo "  (参考) AAAAレコードがあります。CAはIPv6で接続することがあるため、http-01 を使う場合は"
+            echo "         IPv6でも80番ポートで応答することを確認してください。"
+        fi
+    fi
+
+    echo "--- tls-alpn-01 ---"
+    echo "  → UPKIのACMEでは使えません"
+}
+
 # MPIC判定を行う関数
 # 併せて、検出した不備が「CSRによる申請」「ACMEによる発行」のそれぞれでどう現れるかを分類して出力する。
 evaluate_mpic() {
@@ -931,6 +1114,8 @@ evaluate_mpic() {
     #    BR 4.2.2.1.2 (SC-098) により、2027-03-15 からCAはこれらのパラメータの処理が必須になる。
     #    施行日より前は判定に反映せず、施行日以降に起きることを【注意】として表示する。
     local param_domain="" param_caa=""
+    # CAAで許可されているACMEの方式 (施行日以降に validationmethods で限定されていれば、その方式だけになる)
+    local caa_acme_allowed=$UPKI_ACME_METHODS
     if [ $caa_ng -eq 0 ]; then
         for (( i=0; i<${#rel_domains[@]}; i++ )); do
             if [ -n "${rel_domains[i]}" ]; then
@@ -951,6 +1136,7 @@ evaluate_mpic() {
             if [[ ! "$TODAY" < "$CAA_PARAMS_EFFECTIVE" ]]; then
                 enforced=1
                 when=""
+                caa_acme_allowed=$(kv_get "$effects" acme_allowed | tr ',' ' ')
             else
                 when="${CAA_PARAMS_EFFECTIVE}以降、"
             fi
@@ -969,11 +1155,11 @@ evaluate_mpic() {
                 if [ $enforced -eq 1 ]; then
                     mpic_pass=0
                     acme_state=0
-                    fail_reasons+=("・実効CAAレコードの validationmethods ($params) にACMEの検証方式(dns-01 / http-01 / tls-alpn-01)が含まれないため、ACMEでは発行できません。(ドメイン: $param_domain)")
+                    fail_reasons+=("・実効CAAレコードの validationmethods ($params) にUPKIのACMEで使える検証方式(dns-01 / http-01)が含まれないため、ACMEでは発行できません。(ドメイン: $param_domain)")
                     fail_reasons+=("  [ACME発行の場合] 2027-03-15以降、CAはvalidationmethodsの処理が必須です(BR 4.2.2.1.2、SC-098)。")
                     fail_reasons+=("                   ACMEクライアントで使う検証方式を validationmethods に追加してください。")
                 else
-                    warnings+=("・${when}ACMEでは発行できなくなります。実効CAAレコードの validationmethods ($params) にACMEの検証方式(dns-01 / http-01 / tls-alpn-01)が含まれません。(ドメイン: $param_domain)")
+                    warnings+=("・${when}ACMEでは発行できなくなります。実効CAAレコードの validationmethods ($params) にUPKIのACMEで使える検証方式(dns-01 / http-01)が含まれません。(ドメイン: $param_domain)")
                     warnings+=("  BR 4.2.2.1.2 (SC-098) により、${CAA_PARAMS_EFFECTIVE}からCAは validationmethods の処理が必須になります。")
                 fi
             else
@@ -989,6 +1175,54 @@ evaluate_mpic() {
                     warnings+=("  UPKIで払い出されたACMEアカウントのURLと一致するか確認してください。")
                 fi
             fi
+        fi
+    fi
+
+    # 4-3. ACME向けの事前確認 (UPKIのACMEで使える dns-01 / http-01)
+    #    候補の方式(--acme-method の指定、なければ dns-01 と http-01)のうち、CAAで許可され、
+    #    DNSの面で使える方式が1つもなければ、ACMEでは発行できない
+    local acme_usable=""
+    if [ $acme_state -eq 1 ]; then
+        collect_acme_info "$fqdn"
+        local candidates m problem acme_problems=()
+        candidates=${ACME_METHOD:-$UPKI_ACME_METHODS}
+        for m in $candidates; do
+            if [[ " $caa_acme_allowed " != *" $m "* ]]; then
+                problem="実効CAAレコードの validationmethods で許可されていません"
+            elif [ "$m" == "dns-01" ]; then
+                problem=$(acme_dns01_problem)
+            else
+                problem=$(acme_http01_problem)
+            fi
+            if [ -n "$problem" ]; then
+                acme_problems+=("  $m: $problem")
+            else
+                acme_usable="${acme_usable:+$acme_usable, }$m"
+            fi
+        done
+
+        if [ -z "$acme_usable" ]; then
+            mpic_pass=0
+            acme_state=0
+            if [ -n "$ACME_METHOD" ]; then
+                fail_reasons+=("・--acme-method で指定した検証方式 ($ACME_METHOD) では、ACMEで発行できません。")
+            else
+                fail_reasons+=("・UPKIのACMEで使える検証方式 (dns-01 / http-01) のどちらでも、ACMEで発行できません。")
+            fi
+            fail_reasons+=("${acme_problems[@]}")
+            fail_reasons+=("  [ACME発行の場合] dns-01 は _acme-challenge.$fqdn にTXTレコードを置ける(名前解決できる)こと、")
+            fail_reasons+=("                   http-01 はCAがインターネットから80番ポートで接続できるアドレスがあることが必要です。")
+        fi
+
+        if [[ "$acme_usable" == *"dns-01"* ]] && [ "$ACME_CHAL_DANGLING" == "1" ]; then
+            warnings+=("・_acme-challenge.$fqdn のCNAMEの参照先 ($ACME_CHAL_CNAME) が存在しません (NXDOMAIN)。")
+            warnings+=("  dns-01 の委任先(acme-dns など)の設定が消えていないか確認してください。")
+        fi
+        # AAAAレコードがあること自体は問題ではなく、IPv6に対応したドメインでは普通のことなので、
+        # 【注意】にはせず詳細表示での参考表示にとどめる (print_acme_info)
+        if [[ "$acme_usable" == *"http-01"* ]] && [ -n "$ACME_PRIVATE_ADDRS" ]; then
+            warnings+=("・$fqdn のアドレスにプライベートアドレス ($ACME_PRIVATE_ADDRS) が含まれています。")
+            warnings+=("  CAがこのアドレスに接続すると、http-01 の検証に失敗します。")
         fi
     fi
 
@@ -1094,7 +1328,7 @@ evaluate_mpic() {
         0) echo "  CSR申請  : ❌ 発行できない可能性が高いです。" ;;
     esac
     case $acme_state in
-        1) echo "  ACME発行 : ✅ DNS/CAA面で発行を妨げる問題は見つかりませんでした。(dns-01では別途 _acme-challenge.$fqdn のTXT設置が必要です)" ;;
+        1) echo "  ACME発行 : ✅ DNS/CAA面で発行を妨げる問題は見つかりませんでした。(使える検証方式: $acme_usable)" ;;
         0) echo "  ACME発行 : ❌ 発行できません。" ;;
     esac
     echo "--------------------------------------------------"
@@ -1174,6 +1408,12 @@ check_one_fqdn() {
     echo "権威DNSサーバーでの確認 (再帰なしで直接問い合わせ)"
     echo "=================================================="
     print_auth_info "$target"
+
+    echo ""
+    echo "=================================================="
+    echo "ACME向けの事前確認 (UPKIのACMEで使える dns-01 / http-01)"
+    echo "=================================================="
+    print_acme_info "$target"
 
     # MPIC判定の実行
     evaluate_mpic "$target"

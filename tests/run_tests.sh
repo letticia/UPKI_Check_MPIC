@@ -117,23 +117,29 @@ check_effects() {
     assert_eq "$name" "$expected" "$(caa_parameter_effects "$records" | grep -v '^params=' | tr '\n' ' ' | sed 's/ $//')"
 }
 check_effects "パラメータなし" '0 issue "secomtrust.net"' \
-    "has_params=0 acme_ok=1 acme_methods=all acme_tbr_only=0 acme_acct= csr_ok=1"
+    "has_params=0 acme_ok=1 acme_methods=all acme_allowed=dns-01,http-01 acme_tbr_only=0 acme_acct= csr_ok=1"
 check_effects "ACMEの方式を含まない validationmethods" '0 issue "secomtrust.net; validationmethods=ca-tbr-4"' \
-    "has_params=1 acme_ok=0 acme_methods= acme_tbr_only=0 acme_acct= csr_ok=0"
+    "has_params=1 acme_ok=0 acme_methods= acme_allowed= acme_tbr_only=0 acme_acct= csr_ok=0"
 check_effects "ACMEの方式を含む validationmethods" '0 issue "secomtrust.net; validationmethods=dns-01,http-01"' \
-    "has_params=1 acme_ok=1 acme_methods=dns-01,http-01 acme_tbr_only=0 acme_acct= csr_ok=0"
+    "has_params=1 acme_ok=1 acme_methods=dns-01,http-01 acme_allowed=dns-01,http-01 acme_tbr_only=0 acme_acct= csr_ok=0"
 check_effects "ca-tbr-N の形のACMEの方式" '0 issue "secomtrust.net; validationmethods=ca-tbr-7,ca-tbr-19"' \
-    "has_params=1 acme_ok=1 acme_methods=ca-tbr-7,ca-tbr-19 acme_tbr_only=1 acme_acct= csr_ok=0"
+    "has_params=1 acme_ok=1 acme_methods=ca-tbr-7,ca-tbr-19 acme_allowed=dns-01,http-01 acme_tbr_only=1 acme_acct= csr_ok=0"
 check_effects "accounturi" '0 issue "secomtrust.net; accounturi=https://acme.example/acct/1"' \
-    "has_params=1 acme_ok=1 acme_methods=all acme_tbr_only=0 acme_acct=https://acme.example/acct/1 csr_ok=0"
+    "has_params=1 acme_ok=1 acme_methods=all acme_allowed=dns-01,http-01 acme_tbr_only=0 acme_acct=https://acme.example/acct/1 csr_ok=0"
 check_effects "パラメータなしの issue があれば制限なし" '0 issue "secomtrust.net; accounturi=https://acme.example/acct/1",0 issue "secomtrust.net"' \
-    "has_params=1 acme_ok=1 acme_methods=all acme_tbr_only=0 acme_acct= csr_ok=1"
+    "has_params=1 acme_ok=1 acme_methods=all acme_allowed=dns-01,http-01 acme_tbr_only=0 acme_acct= csr_ok=1"
 check_effects "大文字小文字を区別しない" '0 ISSUE "SecomTrust.net; VALIDATIONMETHODS=DNS-01"' \
-    "has_params=1 acme_ok=1 acme_methods=dns-01 acme_tbr_only=0 acme_acct= csr_ok=0"
+    "has_params=1 acme_ok=1 acme_methods=dns-01 acme_allowed=dns-01 acme_tbr_only=0 acme_acct= csr_ok=0"
 check_effects "ほかのCAのパラメータは無視" '0 issue "letsencrypt.org; accounturi=https://acme.example/acct/9",0 issue "secomtrust.net"' \
-    "has_params=0 acme_ok=1 acme_methods=all acme_tbr_only=0 acme_acct= csr_ok=1"
+    "has_params=0 acme_ok=1 acme_methods=all acme_allowed=dns-01,http-01 acme_tbr_only=0 acme_acct= csr_ok=1"
 check_effects "1つのレコードに両方のパラメータ" '0 issue "secomtrust.net; validationmethods=http-01; accounturi=acct:x@secomtrust.net"' \
-    "has_params=1 acme_ok=1 acme_methods=http-01 acme_tbr_only=0 acme_acct=acct:x@secomtrust.net csr_ok=0"
+    "has_params=1 acme_ok=1 acme_methods=http-01 acme_allowed=http-01 acme_tbr_only=0 acme_acct=acct:x@secomtrust.net csr_ok=0"
+check_effects "tls-alpn-01 だけはUPKIのACMEで使えない" '0 issue "secomtrust.net; validationmethods=tls-alpn-01"' \
+    "has_params=1 acme_ok=0 acme_methods= acme_allowed= acme_tbr_only=0 acme_acct= csr_ok=0"
+check_effects "ca-tbr-20 (tls-alpn-01) もUPKIのACMEで使えない" '0 issue "secomtrust.net; validationmethods=ca-tbr-20"' \
+    "has_params=1 acme_ok=0 acme_methods= acme_allowed= acme_tbr_only=0 acme_acct= csr_ok=0"
+check_effects "tls-alpn-01 と並んだ http-01 は使える" '0 issue "secomtrust.net; validationmethods=tls-alpn-01,http-01"' \
+    "has_params=1 acme_ok=1 acme_methods=http-01 acme_allowed=http-01 acme_tbr_only=0 acme_acct= csr_ok=0"
 assert_eq "表示用のパラメータ" "validationmethods=http-01; accounturi=acct:x@secomtrust.net" \
     "$(kv_get "$(caa_parameter_effects '0 issue "secomtrust.net; validationmethods=http-01; accounturi=acct:x@secomtrust.net"')" params)"
 
@@ -305,7 +311,7 @@ echo "■ CAAのパラメータ (施行日 2027-03-15 以降)"
 export CHECK_MPIC_TODAY="2027-03-15"
 assert_judgement vm-email.alpha.ac.jp "⚠️" "❌"
 run_script -q vm-email.alpha.ac.jp
-assert_contains "ACMEの方式がない" "← 実効CAAレコードの validationmethods (validationmethods=ca-tbr-4) にACMEの検証方式(dns-01 / http-01 / tls-alpn-01)が含まれないため、ACMEでは発行できません。" "$RUN_OUTPUT"
+assert_contains "ACMEの方式がない" "← 実効CAAレコードの validationmethods (validationmethods=ca-tbr-4) にUPKIのACMEで使える検証方式(dns-01 / http-01)が含まれないため、ACMEでは発行できません。" "$RUN_OUTPUT"
 assert_eq "ACMEで発行できなければ終了コード 2" "2" "$LAST_STATUS"
 run_script vm-email.alpha.ac.jp
 assert_contains "CSRの見通しは要確認" "CSR申請  : ⚠️  実効CAAレコードのパラメータ(validationmethods=ca-tbr-4)でUPKIのCSR申請が許可されるか、UPKI/CAへの確認が必要です。" "$RUN_OUTPUT"
@@ -332,6 +338,90 @@ assert_not_contains "パラメータなしの issue があれば注意なし" "�
 
 run_script -q ok.alpha.ac.jp
 assert_eq "パラメータのない通常のドメインは影響なし" "0" "$LAST_STATUS"
+unset CHECK_MPIC_TODAY
+
+echo "■ is_private_ip"
+for a in 10.1.2.3 172.16.0.1 172.31.255.255 192.168.1.1 127.0.0.1 169.254.1.1 100.64.0.1 100.127.255.255 0.0.0.0 ::1 :: fc00::1 fd12::1 fe80::1 FE80::1; do
+    if is_private_ip "$a"; then pass "接続できない: $a"; else fail "接続できない: $a"; fi
+done
+for a in 192.0.2.1 172.15.0.1 172.32.0.1 100.63.255.255 100.128.0.1 8.8.8.8 2001:db8::1 2606:4700::1; do
+    if is_private_ip "$a"; then fail "接続できる: $a"; else pass "接続できる: $a"; fi
+done
+
+echo "■ ACME向けの事前確認"
+assert_judgement acme-private.alpha.ac.jp "✅" "✅"
+run_script acme-private.alpha.ac.jp
+assert_contains "http-01 はプライベートアドレスだけなら使えない" "→ 使えません: アドレスがすべてプライベートアドレスのため、CAが接続できません (10.1.2.3)" "$RUN_OUTPUT"
+assert_contains "dns-01 は使えるので ACME は可" "(使える検証方式: dns-01)" "$RUN_OUTPUT"
+assert_contains "tls-alpn-01 はUPKIでは使えない" "--- tls-alpn-01 ---" "$RUN_OUTPUT"
+assert_contains "tls-alpn-01 の表示" "→ UPKIのACMEでは使えません" "$RUN_OUTPUT"
+run_script acme-noaddr.alpha.ac.jp
+assert_contains "Aレコード・AAAAレコードがなければ http-01 は使えない" "→ 使えません: Aレコード・AAAAレコードがありません" "$RUN_OUTPUT"
+
+assert_judgement acme-broken.alpha.ac.jp "✅" "❌"
+run_script acme-broken.alpha.ac.jp
+assert_contains "どちらの方式も使えなければACME不可" "UPKIのACMEで使える検証方式 (dns-01 / http-01) のどちらでも、ACMEで発行できません。" "$RUN_OUTPUT"
+assert_contains "dns-01 が使えない理由" "dns-01: _acme-challenge.acme-broken.alpha.ac.jp の名前解決に失敗しました (8.8.8.8=SERVFAIL, 1.1.1.1=SERVFAIL)" "$RUN_OUTPUT"
+assert_contains "http-01 が使えない理由" "http-01: アドレスがすべてプライベートアドレスのため、CAが接続できません (192.168.10.10)" "$RUN_OUTPUT"
+assert_eq "ACMEが不可なら終了コード 2" "2" "$LAST_STATUS"
+
+run_script -q acme-dangle.alpha.ac.jp
+assert_contains "委任先が存在しない" "← 注意: _acme-challenge.acme-dangle.alpha.ac.jp のCNAMEの参照先 (gone.acme-dns.example) が存在しません (NXDOMAIN)。" "$RUN_OUTPUT"
+assert_eq "委任先が存在しなければ終了コード 1" "1" "$LAST_STATUS"
+run_script acme-delegated.alpha.ac.jp
+assert_contains "委任のCNAMEを表示" "CNAME: abcd1234.auth.acme-dns.example" "$RUN_OUTPUT"
+assert_not_contains "委任先があれば注意なし" "【注意】" "$RUN_OUTPUT"
+run_script acme-txt.alpha.ac.jp
+assert_contains "残っているTXTを表示" "TXT: \"old-token\"" "$RUN_OUTPUT"
+assert_eq "残っているTXTは注意にしない" "0" "$LAST_STATUS"
+
+run_script -q acme-v6.alpha.ac.jp
+assert_eq "AAAAレコードは終了コードに影響しない" "0" "$LAST_STATUS"
+assert_not_contains "AAAAレコードは注意にしない" "注意" "$RUN_OUTPUT"
+run_script acme-v6.alpha.ac.jp
+assert_contains "AAAAレコードは詳細表示で参考として表示" "(参考) AAAAレコードがあります。CAはIPv6で接続することがあるため" "$RUN_OUTPUT"
+assert_contains "IPv6アドレスも接続できるアドレスに含める" "CAが接続できるアドレス: 192.0.2.40, 2001:db8::40" "$RUN_OUTPUT"
+assert_not_contains "AAAAレコードは【注意】にしない" "【注意】" "$RUN_OUTPUT"
+run_script ok.alpha.ac.jp
+assert_not_contains "AAAAレコードがなければ参考表示もしない" "(参考) AAAA" "$RUN_OUTPUT"
+run_script -q acme-mixed.alpha.ac.jp
+assert_contains "プライベートアドレスの混在の注意" "← 注意: acme-mixed.alpha.ac.jp のアドレスにプライベートアドレス (172.16.0.41) が含まれています。" "$RUN_OUTPUT"
+run_script -q --acme-method dns-01 acme-mixed.alpha.ac.jp
+assert_eq "dns-01 を指定すれば http-01 の注意は出さない" "0" "$LAST_STATUS"
+
+echo "■ --acme-method"
+run_script -q --acme-method http-01 acme-private.alpha.ac.jp
+assert_contains "http-01 を指定してプライベートアドレスだけなら不可" "← --acme-method で指定した検証方式 (http-01) では、ACMEで発行できません。" "$RUN_OUTPUT"
+assert_eq "指定した方式で発行できなければ終了コード 2" "2" "$LAST_STATUS"
+run_script -q --acme-method dns-01 acme-private.alpha.ac.jp
+assert_eq "dns-01 を指定すれば可" "0" "$LAST_STATUS"
+run_script --acme-method dns-01 acme-private.alpha.ac.jp
+assert_contains "指定した方式を表示" "--acme-method で指定された検証方式: dns-01" "$RUN_OUTPUT"
+run_script -q --acme-method dns-01 acme-dangle.alpha.ac.jp
+assert_eq "dns-01 を指定すれば委任先の注意も出す" "1" "$LAST_STATUS"
+run_script -q --acme-method http-01 acme-dangle.alpha.ac.jp
+assert_eq "http-01 を指定すれば委任先の注意は出さない" "0" "$LAST_STATUS"
+run_script -q --acme-method tls-alpn-01 ok.alpha.ac.jp
+assert_eq "tls-alpn-01 はエラー(終了コード 3)" "3" "$LAST_STATUS"
+assert_contains "tls-alpn-01 のエラーの説明" "tls-alpn-01 はUPKIのACMEでは使えません。" "$RUN_OUTPUT"
+run_script -q --acme-method foo ok.alpha.ac.jp
+assert_eq "不明な方式はエラー(終了コード 3)" "3" "$LAST_STATUS"
+run_script -q --acme-method
+assert_eq "方式の指定なしはエラー(終了コード 3)" "3" "$LAST_STATUS"
+
+echo "■ ACME向けの事前確認とCAAのパラメータ"
+export CHECK_MPIC_TODAY="2027-03-15"
+assert_judgement vm-http-private.alpha.ac.jp "⚠️" "❌"
+run_script vm-http-private.alpha.ac.jp
+assert_contains "CAAで許可されていない方式" "dns-01: 実効CAAレコードの validationmethods で許可されていません" "$RUN_OUTPUT"
+assert_contains "CAAで許可された方式が使えない" "http-01: アドレスがすべてプライベートアドレスのため、CAが接続できません (10.3.4.5)" "$RUN_OUTPUT"
+assert_judgement vm-tlsalpn.alpha.ac.jp "⚠️" "❌"
+run_script -q vm-tlsalpn.alpha.ac.jp
+assert_contains "tls-alpn-01 だけのCAAはACME不可" "にUPKIのACMEで使える検証方式(dns-01 / http-01)が含まれないため、ACMEでは発行できません。" "$RUN_OUTPUT"
+export CHECK_MPIC_TODAY="2027-03-14"
+assert_judgement vm-http-private.alpha.ac.jp "✅" "✅"
+run_script vm-http-private.alpha.ac.jp
+assert_contains "施行日前はCAAの限定を判定に使わない" "(使える検証方式: dns-01)" "$RUN_OUTPUT"
 unset CHECK_MPIC_TODAY
 
 echo "■ resolve_path (readlink -f を使わないシンボリックリンクの解決)"
