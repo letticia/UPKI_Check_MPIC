@@ -12,6 +12,8 @@ usage() {
     echo "  -f, --tsv FILE  UPKIの申請TSV(サーバ証明書 発行/更新、ACME利用情報 作成/更新)を読み込み、"
     echo "                  利用管理者FQDN(11列目)とdNSName(13列目)のホスト名をすべて確認します"
     echo "  -q, --quiet     個別の確認ログを省略し、判定のまとめだけを表示します"
+    echo "  --update-psl    Public Suffix List を取り直します (FQDNやTSVを指定しなければ、取り直すだけで終了します)"
+    echo "                  (指定しなくても、${PSL_MAX_AGE_DAYS}日より古ければ自動で取り直します)"
     echo "  -h, --help      この使い方を表示します"
     echo ""
     echo "終了コード: 0=すべて問題なし / 1=条件付き(⚠️)または注意あり / 2=発行できない(❌)判定あり / 3=引数やファイルのエラー"
@@ -35,11 +37,32 @@ EXIT_ERROR=3     # 引数やファイルのエラーで確認できなかった
 CAA_PARAMS_EFFECTIVE="2027-03-15"
 TODAY="${CHECK_MPIC_TODAY:-$(date +%Y-%m-%d)}"
 
+# シンボリックリンクをたどって、実体のファイルの絶対パスを求める
+# (readlink -f は macOS 12.2 以前にないため、どの環境にもある readlink で1段ずつたどる)
+resolve_path() {
+    local path=$1
+    local dir link
+    while [ -L "$path" ]; do
+        dir=$(cd "$(dirname "$path")" && pwd)
+        link=$(readlink "$path")
+        case "$link" in
+            /*) path=$link ;;
+            *) path="$dir/$link" ;;
+        esac
+    done
+    echo "$(cd "$(dirname "$path")" && pwd)/$(basename "$path")"
+}
+
 # シンボリックリンク経由の実行でも実体のあるディレクトリを指すよう解決する
 # (テストから source された場合もこのファイルの場所を基準にするため、$0 ではなく BASH_SOURCE を使う)
-SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+SCRIPT_DIR="$(dirname "$(resolve_path "${BASH_SOURCE[0]}")")"
 # テストなどで別のリストを使えるよう、環境変数 CHECK_MPIC_PSL_FILE で差し替えられるようにする
+# (差し替えたファイルは、--update-psl を指定しない限り自動更新しない)
 PSL_FILE="${CHECK_MPIC_PSL_FILE:-$SCRIPT_DIR/public_suffix_list.dat}"
+PSL_URL="https://publicsuffix.org/list/public_suffix_list.dat"
+# この日数より古い Public Suffix List は自動で取り直す
+PSL_MAX_AGE_DAYS=30
+UPDATE_PSL=0
 
 # コマンドライン引数を解析し、TARGET_FQDN / TSV_FILE / QUIET を設定する
 parse_args() {
@@ -55,6 +78,10 @@ parse_args() {
                 ;;
             -q|--quiet)
                 QUIET=1
+                shift
+                ;;
+            --update-psl)
+                UPDATE_PSL=1
                 shift
                 ;;
             -h|--help)
@@ -77,8 +104,8 @@ parse_args() {
         esac
     done
 
-    # FQDNとTSVはどちらか一方だけを指定する
-    if [[ ( -n "$TSV_FILE" && -n "$TARGET_FQDN" ) || ( -z "$TSV_FILE" && -z "$TARGET_FQDN" ) ]]; then
+    # FQDNとTSVはどちらか一方だけを指定する (--update-psl だけの場合はどちらもなくてよい)
+    if [[ ( -n "$TSV_FILE" && -n "$TARGET_FQDN" ) || ( -z "$TSV_FILE" && -z "$TARGET_FQDN" && $UPDATE_PSL -eq 0 ) ]]; then
         usage
         exit $EXIT_ERROR
     fi
@@ -91,12 +118,55 @@ parse_args() {
     TARGET_FQDN=$(echo "$TARGET_FQDN" | sed 's/\.*$//' | tr '[:upper:]' '[:lower:]')
 }
 
-# Public Suffix List がなければダウンロードする
+# Public Suffix List を取得して差し替える。取得に失敗したら元のファイルには手を触れずに 1 を返す
+# (取得途中のファイルや、PSL以外の内容(エラーページなど)で上書きしないよう、一時ファイルに取得して中身を確かめてから置き換える)
+download_psl() {
+    local file=$1
+    local tmp="$file.tmp.$$"
+    if curl -sS -f "$PSL_URL" -o "$tmp" 2>/dev/null && grep -q '===BEGIN ICANN DOMAINS===' "$tmp" 2>/dev/null; then
+        mv "$tmp" "$file"
+        return 0
+    fi
+    rm -f "$tmp"
+    return 1
+}
+
+# ファイルの更新日時が指定した日数より古ければ真を返す
+is_older_than_days() {
+    local file=$1
+    local days=$2
+    [ -n "$(find "$file" -mtime +"$days" 2>/dev/null)" ]
+}
+
+# Public Suffix List を用意する
+# - ファイルがなければ取得する (取得できなければ確認できないためエラー)
+# - --update-psl の指定があるか、既定の場所のファイルが PSL_MAX_AGE_DAYS 日より古ければ取り直す
+#   (取り直しに失敗しても、手元のリストで確認を続ける)
+# - 取得や更新のお知らせは、-q のまとめを汚さないよう標準エラー出力に出す
 ensure_psl() {
     if [ ! -f "$PSL_FILE" ]; then
-        echo "Public Suffix List ($PSL_FILE) が見つかりません。ダウンロードします..."
-        if ! curl -sS https://publicsuffix.org/list/public_suffix_list.dat -o "$PSL_FILE" || [ ! -s "$PSL_FILE" ]; then
-            echo "Public Suffix List のダウンロードに失敗しました。"
+        echo "Public Suffix List ($PSL_FILE) が見つかりません。ダウンロードします..." >&2
+        if ! download_psl "$PSL_FILE"; then
+            echo "Public Suffix List のダウンロードに失敗しました。" >&2
+            exit $EXIT_ERROR
+        fi
+        return
+    fi
+
+    local reason=""
+    if [ $UPDATE_PSL -eq 1 ]; then
+        reason="--update-psl の指定"
+    elif [ -z "$CHECK_MPIC_PSL_FILE" ] && is_older_than_days "$PSL_FILE" "$PSL_MAX_AGE_DAYS"; then
+        reason="${PSL_MAX_AGE_DAYS}日より古いため"
+    fi
+    [ -z "$reason" ] && return
+
+    echo "Public Suffix List ($PSL_FILE) を取り直します (${reason})..." >&2
+    if download_psl "$PSL_FILE"; then
+        echo "Public Suffix List を更新しました。" >&2
+    else
+        echo "Public Suffix List の取り直しに失敗しました。手元のリストで確認を続けます。" >&2
+        if [ $UPDATE_PSL -eq 1 ] && [ -z "$TARGET_FQDN" ] && [ -z "$TSV_FILE" ]; then
             exit $EXIT_ERROR
         fi
     fi
@@ -1343,6 +1413,11 @@ print_tsv_summary() {
 main() {
     parse_args "$@"
     ensure_psl
+
+    # --update-psl だけを指定した場合は、取り直したところで終了する
+    if [ -z "$TARGET_FQDN" ] && [ -z "$TSV_FILE" ]; then
+        exit $EXIT_OK
+    fi
 
     local r host
     if [ -n "$TSV_FILE" ]; then

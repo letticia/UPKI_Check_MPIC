@@ -334,6 +334,84 @@ run_script -q ok.alpha.ac.jp
 assert_eq "パラメータのない通常のドメインは影響なし" "0" "$LAST_STATUS"
 unset CHECK_MPIC_TODAY
 
+echo "■ resolve_path (readlink -f を使わないシンボリックリンクの解決)"
+mkdir -p "$WORK_DIR/real" "$WORK_DIR/links"
+touch "$WORK_DIR/real/script.sh"
+ln -s ../real/script.sh "$WORK_DIR/links/relative"
+ln -s "$WORK_DIR/links/relative" "$WORK_DIR/absolute"
+REAL_PATH="$(cd "$WORK_DIR/real" && pwd)/script.sh"
+assert_eq "リンクでないファイル" "$REAL_PATH" "$(resolve_path "$WORK_DIR/real/script.sh")"
+assert_eq "相対パスのリンク" "$REAL_PATH" "$(resolve_path "$WORK_DIR/links/relative")"
+assert_eq "絶対パスのリンクから相対パスのリンクへ(2段)" "$REAL_PATH" "$(resolve_path "$WORK_DIR/absolute")"
+
+echo "■ Public Suffix List の取得と更新"
+PSL_FIXTURE="$TESTS_DIR/fixtures/public_suffix_list.dat"
+export MOCK_CURL_LOG="$WORK_DIR/curl.log"
+# 実体のディレクトリに置いたPSLを使う(既定の場所の)構成を、作業用ディレクトリに作る
+mkdir -p "$WORK_DIR/app" "$WORK_DIR/bin"
+cp "$SCRIPT" "$WORK_DIR/app/check_mpic.sh"
+cp "$PSL_FIXTURE" "$WORK_DIR/app/public_suffix_list.dat"
+ln -s ../app/check_mpic.sh "$WORK_DIR/bin/check_mpic"
+APP_PSL="$WORK_DIR/app/public_suffix_list.dat"
+run_app() {
+    RUN_OUTPUT=$(env -u CHECK_MPIC_PSL_FILE "$WORK_DIR/bin/check_mpic" "$@" 2>&1)
+    LAST_STATUS=$?
+}
+curl_calls() {
+    if [ -f "$MOCK_CURL_LOG" ]; then grep -c . "$MOCK_CURL_LOG"; else echo 0; fi
+}
+
+rm -f "$MOCK_CURL_LOG"
+run_app -q ok.alpha.ac.jp
+assert_eq "シンボリックリンク経由で実体の場所のPSLを使う" "0" "$LAST_STATUS"
+assert_eq "新しいPSLは取り直さない" "0" "$(curl_calls)"
+
+touch -t 202001010000 "$APP_PSL"
+rm -f "$MOCK_CURL_LOG"
+MOCK_CURL_SOURCE="$PSL_FIXTURE" run_app -q ok.alpha.ac.jp
+assert_eq "古いPSLを自動で取り直す" "1" "$(curl_calls)"
+assert_contains "取り直しのお知らせ" "を取り直します (30日より古いため)" "$RUN_OUTPUT"
+assert_contains "更新のお知らせ" "Public Suffix List を更新しました。" "$RUN_OUTPUT"
+assert_eq "取り直したあとも確認を続ける" "0" "$LAST_STATUS"
+if is_older_than_days "$APP_PSL" 30; then fail "取り直したファイルは新しくなる"; else pass "取り直したファイルは新しくなる"; fi
+
+touch -t 202001010000 "$APP_PSL"
+MOCK_CURL_FAIL=1 MOCK_CURL_SOURCE="$PSL_FIXTURE" run_app -q ok.alpha.ac.jp
+assert_contains "取り直しに失敗しても続ける" "取り直しに失敗しました。手元のリストで確認を続けます。" "$RUN_OUTPUT"
+assert_eq "取り直しに失敗しても判定は変わらない" "0" "$LAST_STATUS"
+assert_eq "失敗したときは元のファイルを残す" "$(cat "$PSL_FIXTURE")" "$(cat "$APP_PSL")"
+
+echo "not a public suffix list" > "$WORK_DIR/bad.dat"
+MOCK_CURL_SOURCE="$WORK_DIR/bad.dat" run_app -q ok.alpha.ac.jp
+assert_eq "PSLでない内容では上書きしない" "$(cat "$PSL_FIXTURE")" "$(cat "$APP_PSL")"
+assert_eq "一時ファイルを残さない" "0" "$(find "$WORK_DIR/app" -name '*.tmp.*' | grep -c .)"
+
+# 環境変数 CHECK_MPIC_PSL_FILE で指定したファイル
+cp "$PSL_FIXTURE" "$WORK_DIR/custom.dat"
+touch -t 202001010000 "$WORK_DIR/custom.dat"
+rm -f "$MOCK_CURL_LOG"
+CHECK_MPIC_PSL_FILE="$WORK_DIR/custom.dat" MOCK_CURL_SOURCE="$PSL_FIXTURE" run_script -q ok.alpha.ac.jp
+assert_eq "指定したファイルは古くても自動では取り直さない" "0" "$(curl_calls)"
+
+CHECK_MPIC_PSL_FILE="$WORK_DIR/custom.dat" MOCK_CURL_SOURCE="$PSL_FIXTURE" run_script --update-psl
+assert_eq "--update-psl だけなら取り直して終了(終了コード 0)" "0" "$LAST_STATUS"
+assert_eq "--update-psl は指定したファイルでも取り直す" "1" "$(curl_calls)"
+assert_contains "--update-psl のお知らせ" "を取り直します (--update-psl の指定)" "$RUN_OUTPUT"
+assert_not_contains "--update-psl だけなら確認はしない" "MPIC判定結果" "$RUN_OUTPUT"
+
+CHECK_MPIC_PSL_FILE="$WORK_DIR/custom.dat" MOCK_CURL_FAIL=1 run_script --update-psl
+assert_eq "--update-psl だけで失敗したら終了コード 3" "3" "$LAST_STATUS"
+
+CHECK_MPIC_PSL_FILE="$WORK_DIR/custom.dat" MOCK_CURL_FAIL=1 run_script -q --update-psl ok.alpha.ac.jp
+assert_eq "--update-psl とFQDNなら失敗しても確認を続ける" "0" "$LAST_STATUS"
+
+CHECK_MPIC_PSL_FILE="$WORK_DIR/none.dat" MOCK_CURL_SOURCE="$PSL_FIXTURE" run_script -q ok.alpha.ac.jp
+assert_eq "PSLがなければ取得して確認する" "0" "$LAST_STATUS"
+if [ -f "$WORK_DIR/none.dat" ]; then pass "取得したPSLを保存する"; else fail "取得したPSLを保存する"; fi
+CHECK_MPIC_PSL_FILE="$WORK_DIR/none2.dat" MOCK_CURL_FAIL=1 run_script -q ok.alpha.ac.jp
+assert_eq "PSLがなく取得もできなければ終了コード 3" "3" "$LAST_STATUS"
+unset MOCK_CURL_LOG
+
 echo "■ 終了コード"
 run_script -q ok.alpha.ac.jp
 assert_eq "問題なし → 0" "0" "$LAST_STATUS"

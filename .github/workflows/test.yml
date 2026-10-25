@@ -16,7 +16,7 @@ jobs:
       - name: shellcheck
         run: |
           shellcheck --version
-          shellcheck -x check_mpic.sh tests/run_tests.sh tests/mock/dig
+          shellcheck -x check_mpic.sh tests/run_tests.sh tests/mock/dig tests/mock/curl
 
   test:
     # macOS は標準の bash 3.2 / BSD awk、Ubuntu は bash 5 / mawk で確認する
