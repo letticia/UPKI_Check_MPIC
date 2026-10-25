@@ -140,3 +140,22 @@ default  internal.alpha.ac.jp  A  10.0.0.1
 *  oscar.ac.jp  DS  54321 13 2 FEDCBA9876543210FEDCBA9876543210FEDCBA9876543210FEDCBA9876543210
 8.8.8.8  oscar.ac.jp  DNSSEC  BOGUS
 1.1.1.1  oscar.ac.jp  DNSSEC  BOGUS
+
+# --- CAAのパラメータ (RFC 8657、BR 4.2.2.1.2) ---
+# 施行日(2027-03-15)以降は判定に反映し、それより前は【注意】だけを表示する
+# ACMEの方式を含まない validationmethods (メールによる方式のみ) → 施行日以降はACME不可、CSRは要確認
+*  vm-email.alpha.ac.jp  A  192.0.2.30
+*  vm-email.alpha.ac.jp  CAA  0 issue "secomtrust.net; validationmethods=ca-tbr-4"
+# ACMEの方式を含む validationmethods → ACMEは使える方式の注意、CSRは要確認
+*  vm-acme.alpha.ac.jp  A  192.0.2.31
+*  vm-acme.alpha.ac.jp  CAA  0 issue "secomtrust.net; validationmethods=dns-01,http-01"
+# ACMEの方式を ca-tbr-N の形でしか書いていない → ACMEは使えるが書き方の注意
+*  vm-tbr.alpha.ac.jp  A  192.0.2.32
+*  vm-tbr.alpha.ac.jp  CAA  0 issue "secomtrust.net; validationmethods=ca-tbr-7"
+# accounturi → ACMEはアカウントの注意、CSRは要確認
+*  acct.alpha.ac.jp  A  192.0.2.33
+*  acct.alpha.ac.jp  CAA  0 issue "secomtrust.net; accounturi=https://acme.example/acct/123"
+# パラメータなしの issue も併記 → 制限なし
+*  acct-open.alpha.ac.jp  A  192.0.2.34
+*  acct-open.alpha.ac.jp  CAA  0 issue "secomtrust.net; accounturi=https://acme.example/acct/123"
+*  acct-open.alpha.ac.jp  CAA  0 issue "secomtrust.net"

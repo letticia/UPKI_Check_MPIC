@@ -111,6 +111,32 @@ check_caa "不許可" '0 issue "secomtrust.net.evil.example"'
 check_caa "不許可" '128 futuretag "x",0 issue "secomtrust.net"'
 assert_contains "不許可の理由に許可されているCAを示す" "letsencrypt.org" "$(caa_denial_reason '0 issue "letsencrypt.org"')"
 
+echo "■ caa_parameter_effects"
+check_effects() {
+    local name=$1 records=$2 expected=$3
+    assert_eq "$name" "$expected" "$(caa_parameter_effects "$records" | grep -v '^params=' | tr '\n' ' ' | sed 's/ $//')"
+}
+check_effects "パラメータなし" '0 issue "secomtrust.net"' \
+    "has_params=0 acme_ok=1 acme_methods=all acme_tbr_only=0 acme_acct= csr_ok=1"
+check_effects "ACMEの方式を含まない validationmethods" '0 issue "secomtrust.net; validationmethods=ca-tbr-4"' \
+    "has_params=1 acme_ok=0 acme_methods= acme_tbr_only=0 acme_acct= csr_ok=0"
+check_effects "ACMEの方式を含む validationmethods" '0 issue "secomtrust.net; validationmethods=dns-01,http-01"' \
+    "has_params=1 acme_ok=1 acme_methods=dns-01,http-01 acme_tbr_only=0 acme_acct= csr_ok=0"
+check_effects "ca-tbr-N の形のACMEの方式" '0 issue "secomtrust.net; validationmethods=ca-tbr-7,ca-tbr-19"' \
+    "has_params=1 acme_ok=1 acme_methods=ca-tbr-7,ca-tbr-19 acme_tbr_only=1 acme_acct= csr_ok=0"
+check_effects "accounturi" '0 issue "secomtrust.net; accounturi=https://acme.example/acct/1"' \
+    "has_params=1 acme_ok=1 acme_methods=all acme_tbr_only=0 acme_acct=https://acme.example/acct/1 csr_ok=0"
+check_effects "パラメータなしの issue があれば制限なし" '0 issue "secomtrust.net; accounturi=https://acme.example/acct/1",0 issue "secomtrust.net"' \
+    "has_params=1 acme_ok=1 acme_methods=all acme_tbr_only=0 acme_acct= csr_ok=1"
+check_effects "大文字小文字を区別しない" '0 ISSUE "SecomTrust.net; VALIDATIONMETHODS=DNS-01"' \
+    "has_params=1 acme_ok=1 acme_methods=dns-01 acme_tbr_only=0 acme_acct= csr_ok=0"
+check_effects "ほかのCAのパラメータは無視" '0 issue "letsencrypt.org; accounturi=https://acme.example/acct/9",0 issue "secomtrust.net"' \
+    "has_params=0 acme_ok=1 acme_methods=all acme_tbr_only=0 acme_acct= csr_ok=1"
+check_effects "1つのレコードに両方のパラメータ" '0 issue "secomtrust.net; validationmethods=http-01; accounturi=acct:x@secomtrust.net"' \
+    "has_params=1 acme_ok=1 acme_methods=http-01 acme_tbr_only=0 acme_acct=acct:x@secomtrust.net csr_ok=0"
+assert_eq "表示用のパラメータ" "validationmethods=http-01; accounturi=acct:x@secomtrust.net" \
+    "$(kv_get "$(caa_parameter_effects '0 issue "secomtrust.net; validationmethods=http-01; accounturi=acct:x@secomtrust.net"')" params)"
+
 echo "■ is_valid_hostname"
 for h in www.example.ac.jp a-b.example.jp xn--eckwd4c7c.jp; do
     if is_valid_hostname "$h"; then pass "有効: $h"; else fail "有効: $h"; fi
@@ -264,6 +290,49 @@ assert_contains "+cd でも確認したことを示す" "DNSSECの検証失敗�
 assert_not_contains "DNSSEC以外のSERVFAILでは検証失敗と表示しない" "DNSSECの検証失敗が原因です" "$RUN_OUTPUT"
 run_script www.bravo.ac.jp
 assert_contains "署名なしと表示" "DNSSEC: 署名なし" "$RUN_OUTPUT"
+
+echo "■ CAAのパラメータ (施行日 2027-03-15 より前)"
+export CHECK_MPIC_TODAY="2027-03-14"
+assert_judgement vm-email.alpha.ac.jp "✅" "✅"
+run_script -q vm-email.alpha.ac.jp
+assert_eq "施行日前は注意だけ(終了コード 1)" "1" "$LAST_STATUS"
+run_script vm-email.alpha.ac.jp
+assert_contains "施行日以降にACMEで発行できなくなる" "2027-03-15以降、ACMEでは発行できなくなります。実効CAAレコードの validationmethods (validationmethods=ca-tbr-4)" "$RUN_OUTPUT"
+assert_contains "施行日以降にCSR申請が制限される" "2027-03-15以降、CSR申請が実効CAAレコードのパラメータ (validationmethods=ca-tbr-4) で制限されます" "$RUN_OUTPUT"
+assert_not_contains "施行日前はCSRを要確認にしない" "CSR申請  : ⚠️" "$RUN_OUTPUT"
+
+echo "■ CAAのパラメータ (施行日 2027-03-15 以降)"
+export CHECK_MPIC_TODAY="2027-03-15"
+assert_judgement vm-email.alpha.ac.jp "⚠️" "❌"
+run_script -q vm-email.alpha.ac.jp
+assert_contains "ACMEの方式がない" "← 実効CAAレコードの validationmethods (validationmethods=ca-tbr-4) にACMEの検証方式(dns-01 / http-01 / tls-alpn-01)が含まれないため、ACMEでは発行できません。" "$RUN_OUTPUT"
+assert_eq "ACMEで発行できなければ終了コード 2" "2" "$LAST_STATUS"
+run_script vm-email.alpha.ac.jp
+assert_contains "CSRの見通しは要確認" "CSR申請  : ⚠️  実効CAAレコードのパラメータ(validationmethods=ca-tbr-4)でUPKIのCSR申請が許可されるか、UPKI/CAへの確認が必要です。" "$RUN_OUTPUT"
+assert_contains "BRの規定を示す" "CAはvalidationmethodsの処理が必須です(BR 4.2.2.1.2、SC-098)" "$RUN_OUTPUT"
+
+assert_judgement vm-acme.alpha.ac.jp "⚠️" "✅"
+run_script vm-acme.alpha.ac.jp
+assert_contains "ACMEで使える方式の注意" "ACMEで使える検証方式が validationmethods で限定されます (dns-01,http-01)" "$RUN_OUTPUT"
+assert_eq "CSRが要確認なら終了コード 1" "1" "$LAST_STATUS"
+
+assert_judgement vm-tbr.alpha.ac.jp "⚠️" "✅"
+run_script vm-tbr.alpha.ac.jp
+assert_contains "ca-tbr-N の書き方の注意" "ca-tbr-N の形で書かれています" "$RUN_OUTPUT"
+
+assert_judgement acct.alpha.ac.jp "⚠️" "✅"
+run_script acct.alpha.ac.jp
+assert_contains "accounturi の注意" "ACMEでは accounturi で指定されたアカウント (https://acme.example/acct/123) からのみ発行できます" "$RUN_OUTPUT"
+assert_contains "ACME以外の accounturi は判定できない" "ACME以外の申請での accounturi の形式は、このツールでは判定できない" "$RUN_OUTPUT"
+
+assert_judgement acct-open.alpha.ac.jp "✅" "✅"
+run_script -q acct-open.alpha.ac.jp
+assert_eq "パラメータなしの issue があれば終了コード 0" "0" "$LAST_STATUS"
+assert_not_contains "パラメータなしの issue があれば注意なし" "注意" "$RUN_OUTPUT"
+
+run_script -q ok.alpha.ac.jp
+assert_eq "パラメータのない通常のドメインは影響なし" "0" "$LAST_STATUS"
+unset CHECK_MPIC_TODAY
 
 echo "■ 終了コード"
 run_script -q ok.alpha.ac.jp

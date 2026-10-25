@@ -30,6 +30,11 @@ EXIT_WARNING=1   # 条件付き(⚠️)の判定、または【注意】があ�
 EXIT_CRITICAL=2  # 発行できない(❌)判定がある
 EXIT_ERROR=3     # 引数やファイルのエラーで確認できなかった
 
+# CAAの accounturi / validationmethods パラメータ(RFC 8657)の処理がCAに義務づけられる日 (BR 4.2.2.1.2、SC-098)
+# この日より前は判定に反映せず【注意】だけを表示する。テストでは CHECK_MPIC_TODAY で今日の日付を差し替える
+CAA_PARAMS_EFFECTIVE="2027-03-15"
+TODAY="${CHECK_MPIC_TODAY:-$(date +%Y-%m-%d)}"
+
 # シンボリックリンク経由の実行でも実体のあるディレクトリを指すよう解決する
 # (テストから source された場合もこのファイルの場所を基準にするため、$0 ではなく BASH_SOURCE を使う)
 SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
@@ -180,7 +185,7 @@ get_etld_plus_one() {
 #   issue ";" はどのCAにも発行を許可しない
 # - タグ名とドメイン名は大文字小文字を区別しない
 # ※ UPKIではワイルドカード証明書を申請できないため issuewild は判定に使わない
-# ※ issue の値に続く RFC 8657 のパラメータ(accounturi / validationmethods)は判定していない
+# ※ issue の値に続く RFC 8657 のパラメータ(accounturi / validationmethods)は caa_parameter_effects で別に調べる
 caa_denial_reason() {
     echo "$1" | awk -v ca="$CA_DOMAIN" '
     {
@@ -229,6 +234,106 @@ caa_denial_reason() {
             }
         }
     }'
+}
+
+# CA_DOMAIN を許可する issue レコードに付いた RFC 8657 のパラメータが、CSR申請 / ACME発行に与える影響を調べる。
+# 引数: caa_denial_reason と同じ形式のCAAレコード (CA_DOMAIN による発行が許可されていることが前提)
+# 出力: "キー=値" の行
+#   has_params   CA_DOMAIN の issue レコードに accounturi / validationmethods が付いていれば 1
+#   acme_ok      ACMEの検証方式を許可する(validationmethods がないか、ACMEの方式を含む)レコードがあれば 1
+#   acme_methods ACMEで使える方式 (validationmethods のないレコードがあれば "all")
+#   acme_tbr_only ACMEの方式を ca-tbr-7 / 19 / 20 の形でしか許可していなければ 1
+#                 (BRは同じ方式を表すラベルのどれでも許可することを推奨(SHOULD)するにとどまるため)
+#   acme_acct    ACMEで使えるレコードがすべて accounturi 付きなら、その値 (なければ空)
+#   csr_ok       パラメータのないレコードがあれば 1 (CSR申請で使う方式やアカウントによらず許可される)
+#   params       パラメータの内容 (表示用)
+# - パラメータのない issue "secomtrust.net" はどのアカウント・方式でも許可するため、1つでもあれば制限はない
+# - ACMEの方式は IANA の登録名(dns-01 / http-01 / tls-alpn-01)と、同じ方式を表す BR の ca-tbr-7 / 19 / 20
+# - BR では小文字が正式な表記だが、CAが大文字小文字を区別しない照合をしてもよいため、ここでは区別しない
+# - UPKIのCSR申請でCAがどのBR 3.2.2.4の方式を使うか、ACME以外の accounturi をどう定めるかは不明なため、
+#   パラメータで制限されている場合のCSR申請は「要確認」とする
+caa_parameter_effects() {
+    echo "$1" | awk -v ca="$CA_DOMAIN" '
+    BEGIN {
+        acme["dns-01"] = 1; acme["http-01"] = 1; acme["tls-alpn-01"] = 1
+        acme["ca-tbr-7"] = 1; acme["ca-tbr-19"] = 1; acme["ca-tbr-20"] = 1
+        all_acct = 1
+    }
+    {
+        line = $0
+        gsub(/,[0-9]+[ \t]+[A-Za-z0-9]+[ \t]+/, "\n&", line)
+        n = split(line, recs, "\n")
+        for (i = 1; i <= n; i++) {
+            r = recs[i]
+            sub(/^,/, "", r)
+            if (r !~ /^[0-9]+[ \t]+[Ii][Ss][Ss][Uu][Ee][ \t]/) continue
+            value = r
+            sub(/^[0-9]+[ \t]+[A-Za-z0-9]+[ \t]*/, "", value)
+            gsub(/^"|"$/, "", value)
+
+            np = split(value, parts, ";")
+            d = parts[1]
+            gsub(/[ \t]/, "", d)
+            if (tolower(d) != ca) continue
+
+            acct = ""
+            vm = ""
+            for (j = 2; j <= np; j++) {
+                p = parts[j]
+                gsub(/[ \t]/, "", p)
+                if (p == "") continue
+                k = tolower(p)
+                sub(/=.*/, "", k)
+                v = p
+                sub(/^[^=]*=?/, "", v)
+                if (k == "accounturi") acct = v
+                if (k == "validationmethods") vm = tolower(v)
+                if (k == "accounturi" || k == "validationmethods") {
+                    has_params = 1
+                    params = (params == "" ? p : params "; " p)
+                }
+            }
+
+            if (acct == "" && vm == "") csr_ok = 1
+
+            rec_acme = 0
+            if (vm == "") {
+                rec_acme = 1
+                methods_all = 1
+            } else {
+                nl = split(vm, labels, ",")
+                for (m = 1; m <= nl; m++) {
+                    if (labels[m] in acme) {
+                        rec_acme = 1
+                        if (labels[m] !~ /^ca-tbr-/) iana = 1
+                        if (!(labels[m] in seen)) {
+                            seen[labels[m]] = 1
+                            methods = (methods == "" ? labels[m] : methods "," labels[m])
+                        }
+                    }
+                }
+            }
+            if (rec_acme) {
+                acme_ok = 1
+                if (acct == "") all_acct = 0
+                else accts = (accts == "" ? acct : accts ", " acct)
+            }
+        }
+    }
+    END {
+        print "has_params=" (has_params ? 1 : 0)
+        print "acme_ok=" (acme_ok ? 1 : 0)
+        print "acme_methods=" (methods_all ? "all" : methods)
+        print "acme_tbr_only=" (acme_ok && !methods_all && !iana ? 1 : 0)
+        print "acme_acct=" (acme_ok && all_acct ? accts : "")
+        print "csr_ok=" (csr_ok ? 1 : 0)
+        print "params=" params
+    }'
+}
+
+# "キー=値" の行から、指定したキーの値を取り出す
+kv_get() {
+    echo "$1" | sed -n "s/^$2=//p"
 }
 
 # CAAレコードセットを取得するヘルパー関数。
@@ -747,11 +852,80 @@ evaluate_mpic() {
         fail_reasons+=("  [ACME発行の場合] チャレンジ検証に成功しても、finalize時のCAA確認で拒否され発行できません。")
     fi
 
+    # 【注意】: 判定には反映しないが確認したほうがよい点
+    local warnings=()
+    # CSR申請が条件付き(⚠️)になったときの「発行方式別の見通し」の説明 (空なら上位ADNのDCVについての説明)
+    local csr_conditional_msg=""
+
+    # 4-2. 実効CAAレコードの RFC 8657 パラメータ (accounturi / validationmethods)
+    #    BR 4.2.2.1.2 (SC-098) により、2027-03-15 からCAはこれらのパラメータの処理が必須になる。
+    #    施行日より前は判定に反映せず、施行日以降に起きることを【注意】として表示する。
+    local param_domain="" param_caa=""
+    if [ $caa_ng -eq 0 ]; then
+        for (( i=0; i<${#rel_domains[@]}; i++ )); do
+            if [ -n "${rel_domains[i]}" ]; then
+                param_domain=${rel_domains[i]}
+                param_caa=${rel_caas[i]}
+                break
+            fi
+        done
+    fi
+    if [ -n "$param_caa" ]; then
+        local effects
+        effects=$(caa_parameter_effects "$param_caa")
+        if [ "$(kv_get "$effects" has_params)" == "1" ]; then
+            local params acme_methods acme_acct enforced=0 when
+            params=$(kv_get "$effects" params)
+            acme_methods=$(kv_get "$effects" acme_methods)
+            acme_acct=$(kv_get "$effects" acme_acct)
+            if [[ ! "$TODAY" < "$CAA_PARAMS_EFFECTIVE" ]]; then
+                enforced=1
+                when=""
+            else
+                when="${CAA_PARAMS_EFFECTIVE}以降、"
+            fi
+
+            if [ "$(kv_get "$effects" csr_ok)" != "1" ]; then
+                if [ $enforced -eq 1 ] && [ $csr_state -eq 1 ]; then
+                    csr_state=2
+                    csr_conditional_msg="実効CAAレコードのパラメータ($params)でUPKIのCSR申請が許可されるか、UPKI/CAへの確認が必要です。"
+                fi
+                warnings+=("・${when}CSR申請が実効CAAレコードのパラメータ ($params) で制限されます。許可されるかの確認が必要です。(ドメイン: $param_domain)")
+                warnings+=("  UPKIのCSR申請でCAが使う検証方式(BR 3.2.2.4の項番号。validationmethods では ca-tbr-N と書く)や、")
+                warnings+=("  ACME以外の申請での accounturi の形式は、このツールでは判定できないため、UPKI/CAに確認してください。")
+            fi
+
+            if [ "$(kv_get "$effects" acme_ok)" != "1" ]; then
+                if [ $enforced -eq 1 ]; then
+                    mpic_pass=0
+                    acme_state=0
+                    fail_reasons+=("・実効CAAレコードの validationmethods ($params) にACMEの検証方式(dns-01 / http-01 / tls-alpn-01)が含まれないため、ACMEでは発行できません。(ドメイン: $param_domain)")
+                    fail_reasons+=("  [ACME発行の場合] 2027-03-15以降、CAはvalidationmethodsの処理が必須です(BR 4.2.2.1.2、SC-098)。")
+                    fail_reasons+=("                   ACMEクライアントで使う検証方式を validationmethods に追加してください。")
+                else
+                    warnings+=("・${when}ACMEでは発行できなくなります。実効CAAレコードの validationmethods ($params) にACMEの検証方式(dns-01 / http-01 / tls-alpn-01)が含まれません。(ドメイン: $param_domain)")
+                    warnings+=("  BR 4.2.2.1.2 (SC-098) により、${CAA_PARAMS_EFFECTIVE}からCAは validationmethods の処理が必須になります。")
+                fi
+            else
+                if [ "$acme_methods" != "all" ]; then
+                    warnings+=("・${when}ACMEで使える検証方式が validationmethods で限定されます ($acme_methods)。ACMEクライアントがこの方式で検証するか確認してください。(ドメイン: $param_domain)")
+                    if [ "$(kv_get "$effects" acme_tbr_only)" == "1" ]; then
+                        warnings+=("  ACMEの方式名(dns-01 など)ではなく ca-tbr-N の形で書かれています。BRは同じ方式を表すどちらの書き方も許可するよう推奨していますが、")
+                        warnings+=("  必須ではないため、ACMEの方式名も併記すると確実です。")
+                    fi
+                fi
+                if [ -n "$acme_acct" ]; then
+                    warnings+=("・${when}ACMEでは accounturi で指定されたアカウント ($acme_acct) からのみ発行できます。(ドメイン: $param_domain)")
+                    warnings+=("  UPKIで払い出されたACMEアカウントのURLと一致するか確認してください。")
+                fi
+            fi
+        fi
+    fi
+
     # 5. 権威DNSサーバーへの直接問い合わせ
     #    CAのDNS観測点は、どの権威DNSサーバーに問い合わせるかが観測点ごと・問い合わせごとに異なる。
     #    サーバー間で応答が食い違えば観測点間で結果が揃わず、MPICの裏付けが取れない(方式によらず発行できない)。
     #    一部のサーバーの無応答やSOAシリアルの不一致は、必ず失敗するとは限らないため【注意】として扱う。
-    local warnings=()
     collect_auth_info "$fqdn"
     if [ -z "$AUTH_ZONE" ]; then
         warnings+=("・権威DNSサーバー(NSレコード)を特定できなかったため、権威DNSサーバーへの直接確認は行っていません。")
@@ -840,7 +1014,13 @@ evaluate_mpic() {
     echo "【発行方式別の見通し】"
     case $csr_state in
         1) echo "  CSR申請  : ✅ DNS/CAA面で発行を妨げる問題は見つかりませんでした。" ;;
-        2) echo "  CSR申請  : ⚠️  上位ADNでDCV済み(200日以内)かつCAAが適切であれば発行され得ます。UPKI/CAへの確認を推奨します。" ;;
+        2)
+            if [ -n "$csr_conditional_msg" ]; then
+                echo "  CSR申請  : ⚠️  $csr_conditional_msg"
+            else
+                echo "  CSR申請  : ⚠️  上位ADNでDCV済み(200日以内)かつCAAが適切であれば発行され得ます。UPKI/CAへの確認を推奨します。"
+            fi
+            ;;
         0) echo "  CSR申請  : ❌ 発行できない可能性が高いです。" ;;
     esac
     case $acme_state in
@@ -1151,7 +1331,8 @@ print_tsv_summary() {
     echo "--------------------------------------------------"
     echo "※ 1枚の証明書(ACMEでは1回のorder)に含まれるホスト名が1つでも発行できない場合は申請全体が失敗するため、"
     echo "  行の判定は最も悪いホスト名の結果に合わせています。"
-    echo "※ ⚠️  は、上位ADNでDCV済み(200日以内)かつCAAが適切であれば発行され得る状態です。"
+    echo "※ ⚠️  は、上位ADNでDCV済み(200日以内)かつCAAが適切であれば発行され得る状態か、"
+    echo "  CAAのパラメータ(accounturi / validationmethods)でCSR申請が許可されるかUPKI/CAへの確認が必要な状態です。"
     echo "※ (注意あり) は、判定には影響しないものの、権威DNSサーバーの応答などに確認したほうがよい点がある状態です。"
     if [ $QUIET -eq 1 ]; then
         echo "※ 原因の詳細は -q を付けずに実行した個別の確認ログを参照してください。"
