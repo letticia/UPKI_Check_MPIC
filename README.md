@@ -47,7 +47,25 @@
    - `iodef`（違反の報告先）や `issuewild`（ワイルドカード証明書用）に `secomtrust.net` があっても、通常の証明書の許可にはなりません。UPKIではワイルドカード証明書を申請できないため、`issuewild` は判定に使いません。
    - `issue ";"` はすべてのCAの発行を禁止します。
    - critical フラグ（128）付きの未知のタグがあると、CAは発行できません。
-   - `issue` の値に続く RFC 8657 のパラメータ（`accounturi` / `validationmethods`）はまだ判定していません。
+   - `issue` の値に続く RFC 8657 のパラメータ（`accounturi` / `validationmethods`）は、許可の判定とは別に確認します（次の「CAAのパラメータ」を参照）。
+
+   **CAAのパラメータ（RFC 8657、BR 4.2.2.1.2）**
+   SC-098 により、**2027-03-15 から**CAは `issue` に付いた `accounturi`（発行できるアカウントの限定）と `validationmethods`（使える検証方式の限定）の処理が必須になります。
+   実効CAAの `issue "secomtrust.net; ..."` にこれらのパラメータがある場合、次のように扱います。
+
+   | 条件 | ACME発行 | CSR申請 |
+   |---|---|---|
+   | パラメータのない `issue "secomtrust.net"` も別にある | 影響なし | 影響なし |
+   | `validationmethods` にACMEの方式（`dns-01` / `http-01` / `tls-alpn-01`、または同じ方式を表す `ca-tbr-7` / `ca-tbr-19` / `ca-tbr-20`）がない | ❌ | ― |
+   | `validationmethods` にACMEの方式がある | 使える方式を【注意】で表示 | ― |
+   | `validationmethods` がある | ― | ⚠️ 要確認 |
+   | `accounturi` がある | 指定されたアカウントを【注意】で表示 | ⚠️ 要確認 |
+
+   - **2027-03-15 より前は判定に反映せず**、施行日以降に起きることを【注意】として表示します（終了コードは 1）。
+   - CSR申請を「要確認」とするのは、UPKIのCSR申請でCAが使う検証方式（BR 3.2.2.4 の項番号。`validationmethods` では `ca-tbr-N` と書く）や、ACME以外の申請での `accounturi` の形式を、このツールでは判定できないためです。UPKI/CAに確認してください。
+   - ACMEの方式を `ca-tbr-N` の形でしか書いていない場合は、ACMEの方式名（`dns-01` など）も併記するよう【注意】を表示します。BRは同じ方式を表すどちらの書き方も許可するよう推奨（SHOULD）していますが、必須ではないためです。
+   - BRでは小文字が正式な表記ですが、CAが大文字小文字を区別しない照合をしてもよいため、このツールでは区別せずに扱います。
+   - `accounturi` がUPKIで払い出されたACMEアカウントのURLと一致するかは確認していません。
 
 6. **eTLD+1への遡り（Public Suffix List連携）**
    各種レコードの有無にかかわらず、サブドメイン（例: `sub.example.co.jp`）が指定された場合、そのドメインの所属するゾーンの頂点・ベースドメイン（eTLD+1 相当、例: `example.co.jp`）に到達するまで、ドメインラベルを1つずつ削りながら親ドメイン側へと遡って確認を繰り返します。
@@ -173,6 +191,7 @@ CSRフローで「機関ドメインを一度確認して1年使い回す」運�
 ドメインは単純に「最後のドットから数個」だけで頂点を判断することができません（例: `.com` は1つ前が頂点だが、`.co.jp` や `.ac.jp` は2つ前が頂点になるため）。
 本スクリプトは正確な判定を行うため、スクリプトと同じディレクトリに `public_suffix_list.dat` というリストファイルを要求します。存在しない場合は `curl` で自動的にダウンロードして使用します。
 環境変数 `CHECK_MPIC_PSL_FILE` にファイルのパスを指定すると、別の場所にあるリストを使えます（テストではこれで最小限のリストに差し替えています）。
+同じように、環境変数 `CHECK_MPIC_TODAY`（`YYYY-MM-DD` 形式）で今日の日付を差し替えられます。CAAのパラメータの施行日（2027-03-15）より前と後の動作を確かめるときに使います。
 
 ---
 
@@ -371,7 +390,7 @@ tests/run_tests.sh
 |---|---|
 | `tests/run_tests.sh` | テストの本体。失敗が1件でもあれば終了コード 1 を返す |
 | `tests/mock/dig` | 模擬の `dig`。`check_mpic.sh` が使う呼び出し方だけに対応し、ゾーンファイルから応答を返す |
-| `tests/fixtures/zone.txt` | 模擬DNSのゾーン。CAAの配置、CNAME、NXDOMAIN、DNS拠点ごとの応答の違い（SERVFAIL・タイムアウト・不一致）、権威DNSサーバーごとの応答の違い（不一致・SOAシリアル・無応答・拒否）、DNSSECの署名の有無と検証失敗を定義 |
+| `tests/fixtures/zone.txt` | 模擬DNSのゾーン。CAAの配置、CNAME、NXDOMAIN、DNS拠点ごとの応答の違い（SERVFAIL・タイムアウト・不一致）、権威DNSサーバーごとの応答の違い（不一致・SOAシリアル・無応答・拒否）、DNSSECの署名の有無と検証失敗、CAAのパラメータ（accounturi・validationmethods）を定義 |
 | `tests/fixtures/public_suffix_list.dat` | テスト用の最小限の Public Suffix List |
 
 新しい判定ケースを追加するときは、`zone.txt` にレコードを足し、`run_tests.sh` に期待する判定を書きます。
