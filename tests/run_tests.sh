@@ -376,10 +376,17 @@ assert_contains "残っているTXTを表示" "TXT: \"old-token\"" "$RUN_OUTPUT"
 assert_eq "残っているTXTは注意にしない" "0" "$LAST_STATUS"
 
 run_script -q acme-v6.alpha.ac.jp
-assert_contains "AAAAレコードの注意" "← 注意: acme-v6.alpha.ac.jp にAAAAレコード (2001:db8::40) があります。" "$RUN_OUTPUT"
+assert_eq "AAAAレコードは終了コードに影響しない" "0" "$LAST_STATUS"
+assert_not_contains "AAAAレコードは注意にしない" "注意" "$RUN_OUTPUT"
+run_script acme-v6.alpha.ac.jp
+assert_contains "AAAAレコードは詳細表示で参考として表示" "(参考) AAAAレコードがあります。CAはIPv6で接続することがあるため" "$RUN_OUTPUT"
+assert_contains "IPv6アドレスも接続できるアドレスに含める" "CAが接続できるアドレス: 192.0.2.40, 2001:db8::40" "$RUN_OUTPUT"
+assert_not_contains "AAAAレコードは【注意】にしない" "【注意】" "$RUN_OUTPUT"
+run_script ok.alpha.ac.jp
+assert_not_contains "AAAAレコードがなければ参考表示もしない" "(参考) AAAA" "$RUN_OUTPUT"
 run_script -q acme-mixed.alpha.ac.jp
 assert_contains "プライベートアドレスの混在の注意" "← 注意: acme-mixed.alpha.ac.jp のアドレスにプライベートアドレス (172.16.0.41) が含まれています。" "$RUN_OUTPUT"
-run_script -q --acme-method dns-01 acme-v6.alpha.ac.jp
+run_script -q --acme-method dns-01 acme-mixed.alpha.ac.jp
 assert_eq "dns-01 を指定すれば http-01 の注意は出さない" "0" "$LAST_STATUS"
 
 echo "■ --acme-method"

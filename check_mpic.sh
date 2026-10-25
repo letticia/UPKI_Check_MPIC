@@ -905,6 +905,10 @@ print_acme_info() {
         echo "  → 使えません: $problem"
     else
         echo "  → DNSの面では使えます (80番ポートへの実際の接続は確認していません)"
+        if [ -n "$ACME_PUBLIC_V6" ]; then
+            echo "  (参考) AAAAレコードがあります。CAはIPv6で接続することがあるため、http-01 を使う場合は"
+            echo "         IPv6でも80番ポートで応答することを確認してください。"
+        fi
     fi
 
     echo "--- tls-alpn-01 ---"
@@ -1214,15 +1218,11 @@ evaluate_mpic() {
             warnings+=("・_acme-challenge.$fqdn のCNAMEの参照先 ($ACME_CHAL_CNAME) が存在しません (NXDOMAIN)。")
             warnings+=("  dns-01 の委任先(acme-dns など)の設定が消えていないか確認してください。")
         fi
-        if [[ "$acme_usable" == *"http-01"* ]]; then
-            if [ -n "$ACME_PRIVATE_ADDRS" ]; then
-                warnings+=("・$fqdn のアドレスにプライベートアドレス ($ACME_PRIVATE_ADDRS) が含まれています。")
-                warnings+=("  CAがこのアドレスに接続すると、http-01 の検証に失敗します。")
-            fi
-            if [ -n "$ACME_PUBLIC_V6" ]; then
-                warnings+=("・$fqdn にAAAAレコード ($ACME_PUBLIC_V6) があります。")
-                warnings+=("  CAはIPv6で接続することがあるため、http-01 を使う場合はIPv6でも80番ポートで応答することを確認してください。")
-            fi
+        # AAAAレコードがあること自体は問題ではなく、IPv6に対応したドメインでは普通のことなので、
+        # 【注意】にはせず詳細表示での参考表示にとどめる (print_acme_info)
+        if [[ "$acme_usable" == *"http-01"* ]] && [ -n "$ACME_PRIVATE_ADDRS" ]; then
+            warnings+=("・$fqdn のアドレスにプライベートアドレス ($ACME_PRIVATE_ADDRS) が含まれています。")
+            warnings+=("  CAがこのアドレスに接続すると、http-01 の検証に失敗します。")
         fi
     fi
 
