@@ -1,0 +1,37 @@
+#!/bin/bash
+# desc: テスト用の模擬 curl コマンド。Public Suffix List の取得を、ネットワークに接続せずに再現する
+#
+# check_mpic.sh が使う次の呼び出し方だけに対応する
+#   curl -sS -f <URL> -o <保存先>
+#
+# 環境変数
+#   MOCK_CURL_SOURCE  保存先にコピーするファイル (未設定なら取得に失敗する)
+#   MOCK_CURL_FAIL    1 なら取得に失敗する (ネットワークの障害を想定)
+#   MOCK_CURL_LOG     呼び出されたURLを1行ずつ追記するファイル (呼び出しの有無を確かめるため)
+
+url=""
+out=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -o)
+            out=$2
+            shift 2
+            ;;
+        -*)
+            shift
+            ;;
+        *)
+            url=$1
+            shift
+            ;;
+    esac
+done
+
+[ -n "$MOCK_CURL_LOG" ] && echo "$url" >> "$MOCK_CURL_LOG"
+
+if [ "$MOCK_CURL_FAIL" == "1" ] || [ -z "$MOCK_CURL_SOURCE" ] || [ -z "$out" ]; then
+    echo "curl: (6) Could not resolve host" >&2
+    exit 6
+fi
+
+cp "$MOCK_CURL_SOURCE" "$out"
