@@ -159,3 +159,35 @@ default  internal.alpha.ac.jp  A  10.0.0.1
 *  acct-open.alpha.ac.jp  A  192.0.2.34
 *  acct-open.alpha.ac.jp  CAA  0 issue "secomtrust.net; accounturi=https://acme.example/acct/123"
 *  acct-open.alpha.ac.jp  CAA  0 issue "secomtrust.net"
+
+# --- ACME向けの事前確認 (UPKIのACMEで使える dns-01 / http-01) ---
+# アドレスがプライベートアドレスだけ → http-01 は使えない (dns-01 は使える)
+*  acme-private.alpha.ac.jp  A  10.1.2.3
+# Aレコード・AAAAレコードがない → http-01 は使えない
+*  acme-noaddr.alpha.ac.jp  TXT  "v=spf1 -all"
+# _acme-challenge の名前解決に失敗し、アドレスもプライベートだけ → どちらも使えない (ACME不可)
+*  acme-broken.alpha.ac.jp  A  192.168.10.10
+8.8.8.8  _acme-challenge.acme-broken.alpha.ac.jp  STATUS  SERVFAIL
+1.1.1.1  _acme-challenge.acme-broken.alpha.ac.jp  STATUS  SERVFAIL
+# _acme-challenge のCNAMEの参照先(委任先)が存在しない → 【注意】
+*  acme-dangle.alpha.ac.jp  A  192.0.2.46
+*  _acme-challenge.acme-dangle.alpha.ac.jp  CNAME  gone.acme-dns.example
+# _acme-challenge のCNAMEで委任し、参照先にTXTがある → 問題なし
+*  acme-delegated.alpha.ac.jp  A  192.0.2.44
+*  _acme-challenge.acme-delegated.alpha.ac.jp  CNAME  abcd1234.auth.acme-dns.example
+*  abcd1234.auth.acme-dns.example  TXT  "acme-dns-placeholder"
+# 古いTXTが残っている → 参考として表示するだけ
+*  acme-txt.alpha.ac.jp  A  192.0.2.43
+*  _acme-challenge.acme-txt.alpha.ac.jp  TXT  "old-token"
+# AAAAレコードがある → 【注意】(IPv6でも80番ポートで応答するか)
+*  acme-v6.alpha.ac.jp  A  192.0.2.40
+*  acme-v6.alpha.ac.jp  AAAA  2001:db8::40
+# 公開アドレスとプライベートアドレスが混在 → 【注意】
+*  acme-mixed.alpha.ac.jp  A  192.0.2.41
+*  acme-mixed.alpha.ac.jp  A  172.16.0.41
+# CAAで http-01 だけを許可しているのに、アドレスがプライベートだけ → 施行日以降はACME不可
+*  vm-http-private.alpha.ac.jp  A  10.3.4.5
+*  vm-http-private.alpha.ac.jp  CAA  0 issue "secomtrust.net; validationmethods=http-01"
+# CAAで tls-alpn-01 だけを許可 → UPKIのACMEでは使えないため、施行日以降はACME不可
+*  vm-tlsalpn.alpha.ac.jp  A  192.0.2.45
+*  vm-tlsalpn.alpha.ac.jp  CAA  0 issue "secomtrust.net; validationmethods=tls-alpn-01"
