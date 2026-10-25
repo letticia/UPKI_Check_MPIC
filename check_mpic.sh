@@ -318,6 +318,9 @@ process_fqdn() {
     fi
     if [[ "$code" == "SERVFAIL" ]]; then
         echo "名前解決ができません (status: SERVFAIL)。"
+        if is_dnssec_failure "$fqdn" "$dns"; then
+            echo "  署名の検証を省く(+cd)と解決できるため、DNSSECの検証失敗が原因です。"
+        fi
         echo "  [CSR申請/ACME発行に共通] SERVFAILはCAAレコードの確認結果も不明にするため、CAはどちらの方式でも発行できません。"
         echo "                           DNSの設定(委任・DNSSEC等)の修正が必要です。"
         return 1
@@ -422,10 +425,26 @@ get_dns_info() {
     echo "$status|$caa|$cname"
 }
 
+# SERVFAIL の原因が DNSSEC の検証失敗かを調べる。
+# 署名の検証を省く +cd (Checking Disabled) を付けると解決できる場合は、DNSSEC の検証失敗と判断する
+# (署名の期限切れ、DSレコードとDNSKEYの不一致、鍵の更新(ロールオーバー)の失敗など)
+is_dnssec_failure() {
+    local fqdn=$1
+    local dns=$2
+    local dns_opt=""
+    if [ -n "$dns" ]; then
+        dns_opt="@$dns"
+    fi
+    local status
+    status=$(dig "$fqdn" ${dns_opt:+"$dns_opt"} +cd +time=3 +tries=2 +noall +comments | grep -ioE "status: [A-Z]+" | awk '{print toupper($2)}')
+    [ "$status" == "NOERROR" ] || [ "$status" == "NXDOMAIN" ]
+}
+
 # 権威DNSサーバーへの直接問い合わせの結果
 # (表示と判定で同じFQDNを2回問い合わせないよう、最後に確認したFQDNの結果を保持する)
 AUTH_FQDN=""
 AUTH_ZONE=""
+AUTH_DS=""        # 親ゾーンにあるDSレコード (空なら署名なし)
 AUTH_SERVERS=()   # "NS名 (IPv4アドレス)"
 AUTH_STATUS=()
 AUTH_SERIAL=()
@@ -444,6 +463,7 @@ collect_auth_info() {
 
     AUTH_FQDN=$fqdn
     AUTH_ZONE=""
+    AUTH_DS=""
     AUTH_SERVERS=()
     AUTH_STATUS=()
     AUTH_SERIAL=()
@@ -468,6 +488,9 @@ collect_auth_info() {
         name=${name#*.}
     done
     [ -z "$AUTH_ZONE" ] && return
+
+    # 親ゾーンにDSレコードがあれば、このゾーンはDNSSECで署名されている
+    AUTH_DS=$(dig +short DS "$AUTH_ZONE" +time=3 +tries=2 | grep -E '^[0-9]+ ')
 
     local ns addrs addr opt status serial caa cname
     for ns in $ns_list; do
@@ -513,6 +536,11 @@ print_auth_info() {
         return
     fi
     echo "ゾーン: $AUTH_ZONE"
+    if [ -n "$AUTH_DS" ]; then
+        echo "DNSSEC: 署名あり (親ゾーンにDSレコードがあります。検証の成否はMPIC判定結果をご参照ください)"
+    else
+        echo "DNSSEC: 署名なし (親ゾーンにDSレコードがありません)"
+    fi
     local i
     for (( i=0; i<${#AUTH_SERVERS[@]}; i++ )); do
         echo "--- ${AUTH_SERVERS[i]} ---"
@@ -600,11 +628,28 @@ evaluate_mpic() {
         mpic_pass=0
         csr_state=0
         acme_state=0
-        fail_reasons+=("・パブリックDNS (8.8.8.8 または 1.1.1.1) で名前解決に失敗しました (Status: 8.8.8.8=$stat_8888, 1.1.1.1=$stat_1111)。")
-        fail_reasons+=("  [原因推測] 権威DNSサーバー側で、海外からのIPアクセス制限（GeoIPブロッキング）が行われている可能性が高いです。")
-        fail_reasons+=("  [CSR申請の場合]  MPICはACME固有の仕組みではなくBR 3.2.2.4の全DCV方式(CAAの参照を含む)に適用されるため、CSR方式でも同様に発行が抑制されます。")
-        fail_reasons+=("                   (現在は4つのリモート観測点のうち3点以上が主観測点と一致し、かつ2つ以上のRIR地域からの観測が必要)")
-        fail_reasons+=("  [ACME発行の場合] 主観測点からのチャレンジ検証に成功しても、リモート観測点による再検証で裏付けが取れずauthorizationがinvalidになります。")
+
+        # 8.8.8.8 / 1.1.1.1 はDNSSECの検証を行うため、署名に不備があるとSERVFAILを返す。
+        # GeoIPブロッキングと見分けるため、SERVFAILだったリゾルバに +cd を付けて問い合わせ直す
+        local dnssec_bogus=()
+        [ "$stat_8888" == "SERVFAIL" ] && is_dnssec_failure "$fqdn" "8.8.8.8" && dnssec_bogus+=("8.8.8.8")
+        [ "$stat_1111" == "SERVFAIL" ] && is_dnssec_failure "$fqdn" "1.1.1.1" && dnssec_bogus+=("1.1.1.1")
+
+        if [ ${#dnssec_bogus[@]} -gt 0 ]; then
+            fail_reasons+=("・DNSSECの検証に失敗したため、パブリックDNS (${dnssec_bogus[*]}) で名前解決できませんでした (Status: 8.8.8.8=$stat_8888, 1.1.1.1=$stat_1111)。")
+            fail_reasons+=("  [原因推測] 署名の検証を省く(+cd)と解決できるため、DNSSECの署名に不備があります。")
+            fail_reasons+=("             署名の期限切れ、親ゾーンのDSレコードとDNSKEYの不一致、鍵の更新(ロールオーバー)の失敗などが考えられます。")
+            fail_reasons+=("             DNSVizなどの診断ツールで、どの段階で検証に失敗しているかを確認してください。")
+            fail_reasons+=("  [CSR申請/ACME発行に共通] 2026-03-15以降、CAはDNSSECの検証が必須です(SC-085v2)。")
+            fail_reasons+=("                           検証に失敗するドメインはCAAやDCVの確認ができないため、どちらの方式でも発行できません。")
+        else
+            fail_reasons+=("・パブリックDNS (8.8.8.8 または 1.1.1.1) で名前解決に失敗しました (Status: 8.8.8.8=$stat_8888, 1.1.1.1=$stat_1111)。")
+            fail_reasons+=("  [原因推測] 権威DNSサーバー側で、海外からのIPアクセス制限（GeoIPブロッキング）が行われている可能性が高いです。")
+            fail_reasons+=("             (署名の検証を省く(+cd)と解決できるかも確認しましたが、DNSSECの検証失敗ではありませんでした)")
+            fail_reasons+=("  [CSR申請の場合]  MPICはACME固有の仕組みではなくBR 3.2.2.4の全DCV方式(CAAの参照を含む)に適用されるため、CSR方式でも同様に発行が抑制されます。")
+            fail_reasons+=("                   (現在は4つのリモート観測点のうち3点以上が主観測点と一致し、かつ2つ以上のRIR地域からの観測が必要)")
+            fail_reasons+=("  [ACME発行の場合] 主観測点からのチャレンジ検証に成功しても、リモート観測点による再検証で裏付けが取れずauthorizationがinvalidになります。")
+        fi
     fi
 
     # 2. NXDOMAIN (対象FQDN自体が引けない)

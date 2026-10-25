@@ -126,3 +126,17 @@ default  internal.alpha.ac.jp  A  10.0.0.1
 *  november.ac.jp  NS  ns1.november-dns.net
 *  ns1.november-dns.net  A  192.0.2.91
 192.0.2.91  *  STATUS  TIMEOUT
+
+# --- DNSSEC ---
+# alpha.ac.jp は署名済み (親ゾーンにDSレコードがあり、検証に成功する)
+*  alpha.ac.jp  DS  12345 13 2 0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF
+# 署名の検証に失敗するゾーン (署名の期限切れなどを想定)
+# 検証する 8.8.8.8 / 1.1.1.1 では SERVFAIL、+cd を付けるか検証しない手元のDNSでは解決できる
+*  www.oscar.ac.jp  A  192.0.2.24
+*  oscar.ac.jp  CAA  0 issue "secomtrust.net"
+*  oscar.ac.jp  NS  ns1.dns-provider.net
+*  oscar.ac.jp  NS  ns2.dns-provider.net
+*  oscar.ac.jp  SOA  ns1.dns-provider.net. hostmaster.oscar.ac.jp. 2026102501 3600 900 604800 300
+*  oscar.ac.jp  DS  54321 13 2 FEDCBA9876543210FEDCBA9876543210FEDCBA9876543210FEDCBA9876543210
+8.8.8.8  oscar.ac.jp  DNSSEC  BOGUS
+1.1.1.1  oscar.ac.jp  DNSSEC  BOGUS

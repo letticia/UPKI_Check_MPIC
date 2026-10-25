@@ -15,11 +15,15 @@
 #     (例: "192.0.2.82 * STATUS TIMEOUT" で、応答しない権威DNSサーバーを表す)
 #   - タイプ STATUS は応答ステータスを上書きする (SERVFAIL / NXDOMAIN / REFUSED / TIMEOUT)
 #   - +norecurse は無視する (権威DNSサーバーもIPアドレスをリゾルバ名として同じように扱う)
+#   - タイプ DNSSEC の値 BOGUS は、そのリゾルバでDNSSECの検証に失敗するゾーンを表す
+#     (例: "8.8.8.8 bogus.ac.jp DNSSEC BOGUS")。ゾーン内と配下の名前は SERVFAIL になり、
+#     署名の検証を省く +cd を付けると通常どおり解決できる
 #   - CNAME は問い合わせタイプが CNAME 以外ならたどる。名前自身か配下にレコードがなければ NXDOMAIN
 
 zone=${MOCK_DNS_ZONE:?MOCK_DNS_ZONE が設定されていません}
 
 short=0
+cd=0
 mode=""
 server="default"
 qtype="A"
@@ -27,11 +31,12 @@ qname=""
 for arg in "$@"; do
     case "$arg" in
         +short) short=1 ;;
+        +cd) cd=1 ;;
         +answer) mode="answer" ;;
         +comments) mode="comments" ;;
         +*) ;;
         @*) server=${arg#@} ;;
-        A|AAAA|CAA|CNAME|TXT|NS|SOA) qtype=$arg ;;
+        A|AAAA|CAA|CNAME|TXT|NS|SOA|DS|DNSKEY) qtype=$arg ;;
         *) qname=$arg ;;
     esac
 done
@@ -41,6 +46,7 @@ qname=$(echo "${qname%.}" | tr '[:upper:]' '[:lower:]')
 records() {
     awk -v res="$server" -v name="$1" '
         /^[ \t]*(#|$)/ { next }
+        $3 == "DNSSEC" { next }
         {
             n = tolower($2)
             sub(/\.$/, "", n)
@@ -62,6 +68,7 @@ records() {
 exists() {
     awk -v res="$server" -v name="$1" '
         /^[ \t]*(#|$)/ { next }
+        $3 == "DNSSEC" { next }
         $1 != res && $1 != "*" { next }
         $3 == "STATUS" { next }
         {
@@ -72,10 +79,27 @@ exists() {
         END { exit !found }' "$zone"
 }
 
+# このリゾルバでDNSSECの検証に失敗するゾーン(またはその配下)の名前か
+is_bogus() {
+    awk -v res="$server" -v name="$1" '
+        /^[ \t]*(#|$)/ { next }
+        ($1 == res || $1 == "*") && $3 == "DNSSEC" && $4 == "BOGUS" {
+            z = tolower($2)
+            sub(/\.$/, "", z)
+            if (name == z || substr(name, length(name) - length(z)) == "." z) { found = 1; exit }
+        }
+        END { exit !found }' "$zone"
+}
+
 status="NOERROR"
 answers=""
 current=$qname
 for _ in 1 2 3 4 5 6 7 8; do
+    if [ $cd -eq 0 ] && is_bogus "$current"; then
+        status="SERVFAIL"
+        break
+    fi
+
     recs=$(records "$current")
 
     st=$(echo "$recs" | awk '$1 == "STATUS" { print $2; exit }')

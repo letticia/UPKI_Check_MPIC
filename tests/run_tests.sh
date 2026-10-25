@@ -245,6 +245,26 @@ assert_contains "NSを特定できない" "← 注意: 権威DNSサーバー(NS�
 run_script -q ok.alpha.ac.jp
 assert_not_contains "問題がなければ注意を出さない" "注意" "$RUN_OUTPUT"
 
+echo "■ DNSSEC"
+if is_dnssec_failure www.oscar.ac.jp 8.8.8.8; then pass "検証失敗のゾーンを判別"; else fail "検証失敗のゾーンを判別"; fi
+if is_dnssec_failure geo.alpha.ac.jp 8.8.8.8; then fail "DNSSEC以外のSERVFAILは検証失敗としない"; else pass "DNSSEC以外のSERVFAILは検証失敗としない"; fi
+assert_judgement www.oscar.ac.jp "❌" "❌"
+run_script -q www.oscar.ac.jp
+assert_contains "まとめに検証失敗と表示" "← DNSSECの検証に失敗したため、パブリックDNS (8.8.8.8 1.1.1.1) で名前解決できませんでした" "$RUN_OUTPUT"
+assert_eq "検証失敗は終了コード 2" "2" "$LAST_STATUS"
+run_script www.oscar.ac.jp
+assert_contains "原因の推測" "署名の検証を省く(+cd)と解決できるため、DNSSECの署名に不備があります。" "$RUN_OUTPUT"
+assert_contains "SC-085v2 への言及" "CAはDNSSECの検証が必須です(SC-085v2)" "$RUN_OUTPUT"
+assert_not_contains "GeoIPと推測しない" "GeoIPブロッキング" "$RUN_OUTPUT"
+assert_contains "リゾルバごとの確認でも検証失敗と表示" "署名の検証を省く(+cd)と解決できるため、DNSSECの検証失敗が原因です。" "$RUN_OUTPUT"
+assert_contains "署名ありと表示" "DNSSEC: 署名あり" "$RUN_OUTPUT"
+run_script geo.alpha.ac.jp
+assert_contains "DNSSEC以外のSERVFAILはGeoIPと推測" "GeoIPブロッキング" "$RUN_OUTPUT"
+assert_contains "+cd でも確認したことを示す" "DNSSECの検証失敗ではありませんでした" "$RUN_OUTPUT"
+assert_not_contains "DNSSEC以外のSERVFAILでは検証失敗と表示しない" "DNSSECの検証失敗が原因です" "$RUN_OUTPUT"
+run_script www.bravo.ac.jp
+assert_contains "署名なしと表示" "DNSSEC: 署名なし" "$RUN_OUTPUT"
+
 echo "■ 終了コード"
 run_script -q ok.alpha.ac.jp
 assert_eq "問題なし → 0" "0" "$LAST_STATUS"
