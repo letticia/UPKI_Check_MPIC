@@ -449,12 +449,14 @@ DIG_CACHE_DIR=""
 # 問い合わせのほとんどは $(...) の中で実行され変数に結果を残せないため、ファイルに保存する。
 # - 引数の順序は結果に影響しないため、並べ替えたものをキーにする
 # - ファイル名にはキーのチェックサムを使い、まれな衝突に備えてキーそのものも保存して照合する
+# - 先読み(prefetch_queries)で複数のプロセスが同時に書き込むため、一時ファイルに書いてから置き換え、
+#   キーのファイルを最後に置く (キーがあれば、結果と終了コードはそろっている)
 dig_cached() {
     if [ -z "$DIG_CACHE_DIR" ]; then
         dig "$@"
         return
     fi
-    local key sum rc
+    local key sum rc tmp
     key=$(printf '%s\n' "$@" | LC_ALL=C sort)
     sum=$(printf '%s' "$key" | cksum | awk '{print $1 "-" $2}')
     local base="$DIG_CACHE_DIR/$sum"
@@ -467,12 +469,124 @@ dig_cached() {
         dig "$@"
         return
     fi
-    dig "$@" > "$base.out"
+    if ! tmp=$(mktemp "$base.XXXXXX" 2>/dev/null); then
+        dig "$@"
+        return
+    fi
+    dig "$@" > "$tmp"
     rc=$?
-    echo "$rc" > "$base.rc"
-    printf '%s' "$key" > "$base.key"
+    echo "$rc" > "$tmp.rc"
+    printf '%s' "$key" > "$tmp.key"
+    mv -f "$tmp" "$base.out"
+    mv -f "$tmp.rc" "$base.rc"
+    mv -f "$tmp.key" "$base.key"
     cat "$base.out"
     return $rc
+}
+
+# DNSへの問い合わせはすべてこの形にそろえる。
+# 同じ名前・タイプ・サーバーへの質問を1回の問い合わせにまとめ(結果を dig_cached で使い回す)、
+# ステータス・回答・CNAMEは、この出力から dns_status / dns_records で取り出す。
+# 引数: タイプ 名前 サーバー(空ならデフォルトDNS) [+norecurse などの追加オプション...]
+dns_query() {
+    local type=$1 name=$2 server=$3
+    shift 3
+    dig_cached "$type" "$name" ${server:+"@$server"} +time=3 +tries=2 +noall +comments +answer "$@"
+}
+
+# 問い合わせを並列に実行して結果を dig_cached のキャッシュに入れ、すべて終わるまで待つ (先読み)。
+# 応答しないDNSサーバーへの問い合わせは1件ごとにタイムアウトまで待つため、順に実行すると待ち時間が積み重なる。
+# 後で必ず(または失敗時に)行う問い合わせを先にまとめて投げておけば、待ち時間は最も遅い1件分で済む。
+# 後の処理は今までどおり順に問い合わせ、キャッシュの結果を使う(判定の処理は変わらない)。
+# 引数: "タイプ 名前 サーバー [追加オプション...]" の形の文字列 (サーバーがデフォルトDNSなら "-")
+# - 後の問い合わせと同じ結果を使い回すため、必ず dns_query の形で問い合わせる
+# - キャッシュがない(使い回さない)ときは、先読みしても使われないので何もしない
+# - 同時に投げると互いのキャッシュを使えないため、同じ問い合わせは先に1つにまとめる
+prefetch_queries() {
+    [ -n "$DIG_CACHE_DIR" ] || return 0
+    printf '%s\n' "$@" | sort -u | {
+        local spec
+        while read -r spec; do
+            [ -z "$spec" ] && continue
+            (
+                # shellcheck disable=SC2086 # 名前などに空白は含まれないため、空白で区切って引数にする
+                set -- $spec
+                prefetch_server=$3
+                [ "$prefetch_server" == "-" ] && prefetch_server=""
+                dns_query "$1" "$2" "$prefetch_server" "${@:4}" > /dev/null 2>&1
+            ) &
+        done
+        # パイプの中で起動したため、ここで待つ
+        wait
+    }
+}
+
+# 名前とその上位ドメインを、TLDまで1行ずつ出力する (例: www.example.jp → www.example.jp, example.jp, jp)
+names_to_tld() {
+    local name=$1
+    while [ -n "$name" ]; do
+        echo "$name"
+        [[ "$name" == *"."* ]] || break
+        name=${name#*.}
+    done
+}
+
+# 1件のFQDNの確認で使う問い合わせを先読みする (prefetch_queries)
+# - 名前解決・CAA・CNAME (デフォルトDNS・8.8.8.8・1.1.1.1)、実効CAAの探索(TLDまで)、SERVFAILの原因の確認(+cd)
+# - NSレコードの検索、ACME向けの事前確認 (_acme-challenge のTXT、AAAA)
+# - 詳細表示では、上位ドメインの確認(デフォルトDNS)も
+# 実効CAAの探索や +cd は途中で終わったり使われなかったりするが、並列に投げるため待ち時間はほとんど増えない
+prefetch_for_fqdn() {
+    local fqdn=$1
+    local detail=$2
+    local etld1 specs=() dns server name
+    etld1=$(get_etld_plus_one "$fqdn" "$PSL_FILE")
+    for dns in - 8.8.8.8 1.1.1.1; do
+        specs+=("A $fqdn $dns" "A $fqdn $dns +cd" "CNAME $fqdn $dns")
+        for name in $(names_to_tld "$fqdn"); do
+            specs+=("CAA $name $dns")
+        done
+    done
+    for name in $(names_from_etld1 "$fqdn" "$etld1"); do
+        specs+=("NS $name -")
+        if [ "$detail" == "1" ]; then
+            specs+=("A $name -" "CNAME $name -")
+        fi
+    done
+    for server in 8.8.8.8 1.1.1.1; do
+        specs+=("TXT _acme-challenge.$fqdn $server" "AAAA $fqdn $server")
+    done
+    show_progress "DNSへの問い合わせ中 (${#specs[@]}件を並列に先読み) ..."
+    prefetch_queries "${specs[@]}"
+    show_progress
+}
+
+# NS名やCNAMEの参照先などのドメイン名を、小文字・末尾のドットなしにそろえて重複を除く
+normalize_names() {
+    tr '[:upper:]' '[:lower:]' | sed 's/\.$//' | sort -u
+}
+
+# dns_query の出力から応答ステータスを取り出す (応答がなければ TIMEOUT_OR_ERROR)
+dns_status() {
+    local status
+    status=$(echo "$1" | grep -ioE "status: [A-Z]+" | head -n 1 | awk '{print toupper($2)}')
+    echo "${status:-TIMEOUT_OR_ERROR}"
+}
+
+# dns_query の出力から、指定したタイプのレコードの値を1行ずつ取り出す
+# 所有者名を指定すると、その名前のレコードだけを取り出す (省くとCNAMEの参照先のレコードも含む)
+dns_records() {
+    echo "$1" | awk -v t="$2" -v n="$3" '
+        BEGIN { n = tolower(n); sub(/\.$/, "", n) }
+        /^;/ || NF < 5 || $4 != t { next }
+        {
+            o = tolower($1)
+            sub(/\.$/, "", o)
+            if (n != "" && o != n) next
+            $1 = $2 = $3 = $4 = ""
+            sub(/^ +/, "")
+            print
+        }'
 }
 
 # CAAレコードセットを取得するヘルパー関数。
@@ -480,14 +594,15 @@ dig_cached() {
 # 出力形式: "CAAが置かれているドメイン名(小文字)|CAAレコードの内容(ソートしてカンマ区切り)" (見つからない場合は "|")
 #   問い合わせに失敗した場合(SERVFAIL・タイムアウトなど)は "!ステータス|" を返す
 #   (CAAレコードがないこととは区別する。NXDOMAINは名前がないだけなので失敗ではない)
+# 引数: 名前 DNSサーバー(空ならデフォルトDNS)
 query_caa() {
     local name=$1
-    local dns_opt=$2
+    local dns=$2
     local out status answer
-    out=$(dig_cached CAA "$name" ${dns_opt:+"$dns_opt"} +time=3 +tries=2 +noall +comments +answer)
-    status=$(echo "$out" | grep -ioE "status: [A-Z]+" | awk '{print toupper($2)}')
-    if [ "$status" != "NOERROR" ] && [ "$status" != "NXDOMAIN" ]; then
-        echo "!${status:-TIMEOUT_OR_ERROR}|"
+    out=$(dns_query CAA "$name" "$dns")
+    status=$(dns_status "$out")
+    if ! is_resolved_status "$status"; then
+        echo "!$status|"
         return
     fi
     answer=$(echo "$out" | awk '$4 == "CAA" { owner = $1; $1 = $2 = $3 = $4 = ""; sub(/^ +/, ""); print owner "\t" $0 }')
@@ -517,16 +632,11 @@ query_caa() {
 find_relevant_caa() {
     local fqdn=$1
     local dns=$2
-    local dns_opt=""
-
-    if [ -n "$dns" ]; then
-        dns_opt="@$dns"
-    fi
 
     local current=$fqdn
     local res owner caa
     while [ -n "$current" ]; do
-        res=$(query_caa "$current" "$dns_opt")
+        res=$(query_caa "$current" "$dns")
         owner=${res%%|*}
         caa=${res#*|}
         if [[ "$owner" == "!"* ]]; then
@@ -555,18 +665,16 @@ find_relevant_caa() {
 process_fqdn() {
     local fqdn=$1
     local dns=$2
-    local dns_opt=""
-    
+
     if [ -n "$dns" ]; then
-        dns_opt="@$dns"
         echo "=== [$fqdn] をDNSサーバ $dns で確認 ==="
     else
         echo "=== [$fqdn] の確認 ==="
     fi
 
-    # 名前解決できるか確認 (タイムアウトを防ぐために +time=3 +tries=2 を付与)
+    # 名前解決できるか確認
     local code
-    code=$(dig_cached "$fqdn" ${dns_opt:+"$dns_opt"} +time=3 +tries=2 +noall +comments | grep -ioE "status: [A-Z]+" | awk '{print $2}' | tr '[:lower:]' '[:upper:]')
+    code=$(dns_status "$(dns_query A "$fqdn" "$dns")")
     # NXDOMAIN と SERVFAIL は発行方式への影響が異なるため分けて説明する
     if [[ "$code" == "NXDOMAIN" ]]; then
         echo "名前解決ができません (status: NXDOMAIN)。"
@@ -585,8 +693,12 @@ process_fqdn() {
         echo "                           DNSの設定(委任・DNSSEC等)の修正が必要です。"
         return 1
     fi
-    if [ -z "$code" ]; then
+    if [[ "$code" == "TIMEOUT_OR_ERROR" ]]; then
         echo "DNSクエリがタイムアウトしたか、応答を取得できませんでした。ネットワークまたはDNSサーバーの状態を確認してください。"
+        return 1
+    fi
+    if ! is_resolved_status "$code"; then
+        echo "名前解決ができません (status: $code)。DNSサーバーの状態や設定を確認してください。"
         return 1
     fi
 
@@ -599,11 +711,11 @@ process_fqdn() {
         # CNAMEが張られている場合、CAAの問い合わせは参照先の結果を返すため、
         # このドメイン自身のCAAとしては表示せず、参照先の確認結果に任せる
         local caa_res
-        caa_res=$(query_caa "$current_fqdn" "$dns_opt")
+        caa_res=$(query_caa "$current_fqdn" "$dns")
         local caa_owner=${caa_res%%|*}
         local caa_result=""
         if [ "$caa_owner" == "$(to_lower "$current_fqdn")" ]; then
-            caa_result=$(dig_cached +short CAA "$current_fqdn" ${dns_opt:+"$dns_opt"} +time=3 +tries=2 | grep -E '^[0-9]+\s+')
+            caa_result=$(dns_records "$(dns_query CAA "$current_fqdn" "$dns")" CAA)
         fi
         if [ -n "$caa_result" ]; then
             if [ $is_cname_target -eq 1 ]; then
@@ -631,7 +743,7 @@ process_fqdn() {
 
         # CNAMEの確認
         local cname_result
-        cname_result=$(dig_cached +short CNAME "$current_fqdn" ${dns_opt:+"$dns_opt"} +time=3 +tries=2)
+        cname_result=$(dns_records "$(dns_query CNAME "$current_fqdn" "$dns")" CNAME "$current_fqdn")
         if [ -n "$cname_result" ]; then
             local next_fqdn
             next_fqdn=$(echo "$cname_result" | head -n 1 | sed 's/\.$//')
@@ -664,18 +776,9 @@ process_fqdn() {
 get_dns_info() {
     local fqdn=$1
     local dns=$2
-    local dns_opt=""
-    
-    if [ -n "$dns" ]; then
-        dns_opt="@$dns"
-    fi
 
-    # タイムアウトを防ぐために +time=3 +tries=2 を付与
     local status
-    status=$(dig_cached "$fqdn" ${dns_opt:+"$dns_opt"} +time=3 +tries=2 +noall +comments | grep -ioE "status: [A-Z]+" | awk '{print $2}' | tr '[:lower:]' '[:upper:]')
-    if [ -z "$status" ]; then
-        status="TIMEOUT_OR_ERROR"
-    fi
+    status=$(dns_status "$(dns_query A "$fqdn" "$dns")")
 
     # CAA・CNAMEはDNS拠点間の比較(すべてNOERRORのときだけ行う)にしか使わないため、
     # 名前解決に失敗したときは問い合わせない (応答しないドメインでタイムアウトを重ねて待たないため)
@@ -683,9 +786,9 @@ get_dns_info() {
     if [ "$status" == "NOERROR" ]; then
         # CAAは実効CAAの探索(find_relevant_caa)と同じ問い合わせにして、結果を使い回す
         local caa_res
-        caa_res=$(query_caa "$fqdn" "$dns_opt")
+        caa_res=$(query_caa "$fqdn" "$dns")
         caa=${caa_res#*|}
-        cname=$(dig_cached +short CNAME "$fqdn" ${dns_opt:+"$dns_opt"} +time=3 +tries=2 | sort | tr '\n' ',' | sed 's/,$//')
+        cname=$(dns_records "$(dns_query CNAME "$fqdn" "$dns")" CNAME "$fqdn" | sort | tr '\n' ',' | sed 's/,$//')
     fi
 
     echo "$status|$caa|$cname"
@@ -697,13 +800,7 @@ get_dns_info() {
 is_dnssec_failure() {
     local fqdn=$1
     local dns=$2
-    local dns_opt=""
-    if [ -n "$dns" ]; then
-        dns_opt="@$dns"
-    fi
-    local status
-    status=$(dig_cached "$fqdn" ${dns_opt:+"$dns_opt"} +cd +time=3 +tries=2 +noall +comments | grep -ioE "status: [A-Z]+" | awk '{print toupper($2)}')
-    [ "$status" == "NOERROR" ] || [ "$status" == "NXDOMAIN" ]
+    is_resolved_status "$(dns_status "$(dns_query A "$fqdn" "$dns" +cd)")"
 }
 
 # 権威DNSサーバーへの直接問い合わせの結果
@@ -737,9 +834,7 @@ get_delegation() {
     local parent=$zone pns=""
     while [[ "$parent" == *"."* ]]; do
         parent=${parent#*.}
-        pns=$(dig_cached NS "$parent" +time=3 +tries=2 +noall +answer | awk -v n="$parent" '
-            { owner = tolower($1); sub(/\.$/, "", owner) }
-            owner == n && $4 == "NS" { v = tolower($5); sub(/\.$/, "", v); print v }' | sort -u)
+        pns=$(dns_records "$(dns_query NS "$parent" "")" NS "$parent" | normalize_names)
         [ -n "$pns" ] && break
     done
     [ -z "$pns" ] && return
@@ -748,13 +843,10 @@ get_delegation() {
     # 応答したサーバーから委任情報が得られたところで終える (応答しないサーバーはとばす)
     local pns_host out
     for pns_host in $pns; do
-        out=$(dig_cached NS "$zone" "@$pns_host" +norecurse +time=3 +tries=2 +noall +comments +answer +authority +additional)
-        echo "$out" | grep -qiE "status: [A-Z]+" || continue
+        out=$(dns_query NS "$zone" "$pns_host" +norecurse +authority +additional)
+        [ "$(dns_status "$out")" == "TIMEOUT_OR_ERROR" ] && continue
         DELEG_REACHED=1
-        DELEG_NS=$(echo "$out" | awk -v n="$zone" '
-            /^;/ { next }
-            { owner = tolower($1); sub(/\.$/, "", owner) }
-            owner == n && $4 == "NS" { v = tolower($5); sub(/\.$/, "", v); print v }' | sort -u)
+        DELEG_NS=$(dns_records "$out" NS "$zone" | normalize_names)
         DELEG_GLUE=$(echo "$out" | awk '
             /^;/ { next }
             $4 == "A" { owner = tolower($1); sub(/\.$/, "", owner); print owner, $5 }' | sort -u)
@@ -762,10 +854,25 @@ get_delegation() {
     done
 }
 
+# eTLD+1 から対象FQDNまでの名前を、上位から順に1行ずつ出力する
+# (例: www.sub.example.ac.jp と example.ac.jp → example.ac.jp, sub.example.ac.jp, www.sub.example.ac.jp)
+names_from_etld1() {
+    local name=$1 etld1=$2 names=""
+    while [ -n "$name" ]; do
+        names="$name"$'\n'"$names"
+        if [ "$name" == "$etld1" ] || [[ "$name" != *"."* ]]; then
+            break
+        fi
+        name=${name#*.}
+    done
+    printf '%s' "$names"
+}
+
 # 対象FQDNが属するゾーンの権威DNSサーバーを特定し、各サーバーへ再帰なし(+norecurse)で直接問い合わせる。
 # パブリックDNSはキャッシュを持ち、国内の拠点から応答するため、権威DNSサーバー間の不一致や
 # 一部のサーバーの無応答(CAの観測点によって結果が変わる原因)は直接問い合わせないと見えない。
-# - ゾーンは、対象FQDNから eTLD+1 まで遡って最初にNSレコードが見つかったドメインとする
+# - ゾーンは、eTLD+1 から対象FQDNへ向かって1ラベルずつ下り、最も下でNSレコードが見つかったドメインとする
+#   (上位から下るのは、問い合わせに失敗したらその下も引けないため、そこで止められるから)
 # - 再帰リゾルバ経由でNSレコードを引けない(ゾーンの権威DNSサーバーがすべて応答しない場合など)ときは、
 #   eTLD+1 の委任情報を親ゾーンから直接取得する。NS名のアドレスもゾーン内にあって引けないことが多いため、グルーを使う
 # - どの権威DNSサーバーも応答しなかったときは、この端末の通信の制限と見分けるため、親ゾーンのサーバーにも問い合わせる
@@ -786,22 +893,18 @@ collect_auth_info() {
     AUTH_SOURCE=""
     AUTH_PARENT_REACHED=""
 
-    local etld1 name ns_list="" glue=""
+    local etld1 name ns_list="" glue="" out ns
     etld1=$(get_etld_plus_one "$fqdn" "$PSL_FILE")
-    name=$fqdn
-    while [ -n "$name" ]; do
+    for name in $(names_from_etld1 "$fqdn" "$etld1"); do
         show_progress "権威DNSサーバーの確認中: NSレコードの検索 ($name) ..."
-        ns_list=$(dig_cached NS "$name" +time=3 +tries=2 +noall +answer | awk -v n="$name" '
-            { owner = tolower($1); sub(/\.$/, "", owner) }
-            owner == n && $4 == "NS" { v = tolower($5); sub(/\.$/, "", v); print v }' | sort -u)
-        if [ -n "$ns_list" ]; then
+        out=$(dns_query NS "$name" "")
+        # 引けなかった(失敗・NXDOMAIN)名前より下の名前も引けないため、そこで止める
+        [ "$(dns_status "$out")" == "NOERROR" ] || break
+        ns=$(dns_records "$out" NS "$name" | normalize_names)
+        if [ -n "$ns" ]; then
             AUTH_ZONE=$name
-            break
+            ns_list=$ns
         fi
-        if [ "$name" == "$etld1" ] || [[ "$name" != *"."* ]]; then
-            break
-        fi
-        name=${name#*.}
     done
     if [ -z "$AUTH_ZONE" ]; then
         show_progress "権威DNSサーバーの確認中: 親ゾーンの委任情報の取得 ($etld1) ..."
@@ -819,27 +922,40 @@ collect_auth_info() {
         return
     fi
 
-    # 親ゾーンにDSレコードがあれば、このゾーンはDNSSECで署名されている
-    show_progress "権威DNSサーバーの確認中: DSレコード ($AUTH_ZONE) ..."
-    AUTH_DS=$(dig_cached +short DS "$AUTH_ZONE" +time=3 +tries=2 | grep -E '^[0-9]+ ')
+    # DSレコードと各NSのアドレス、続いて各権威DNSサーバーへの直接問い合わせを、それぞれ並列に先読みする
+    local specs=() addrs addr status serial caa cname
+    show_progress "権威DNSサーバーの確認中: DSレコードとNSのアドレス ..."
+    specs=("DS $AUTH_ZONE -")
+    for ns in $ns_list; do
+        specs+=("A $ns -")
+    done
+    prefetch_queries "${specs[@]}"
+    specs=()
+    for ns in $ns_list; do
+        for addr in $(auth_ns_addrs "$ns" "$glue"); do
+            specs+=("A $fqdn $addr +norecurse" "SOA $AUTH_ZONE $addr +norecurse" "CAA $fqdn $addr +norecurse")
+        done
+    done
+    if [ ${#specs[@]} -gt 0 ]; then
+        show_progress "権威DNSサーバーの確認中: 各サーバーへの直接問い合わせ ..."
+        prefetch_queries "${specs[@]}"
+    fi
 
-    local ns addrs addr opt status serial caa cname
+    # 親ゾーンにDSレコードがあれば、このゾーンはDNSSECで署名されている
+    AUTH_DS=$(dns_records "$(dns_query DS "$AUTH_ZONE" "")" DS "$AUTH_ZONE")
+
     for ns in $ns_list; do
         show_progress "権威DNSサーバーの確認中: $ns のアドレス ..."
-        addrs=$(dig_cached +short A "$ns" +time=3 +tries=2 | grep -E '^[0-9]+(\.[0-9]+){3}$')
-        if [ -z "$addrs" ] && [ -n "$glue" ]; then
-            addrs=$(echo "$glue" | awk -v n="$ns" '$1 == n { print $2 }')
-        fi
+        addrs=$(auth_ns_addrs "$ns" "$glue")
         if [ -z "$addrs" ]; then
             AUTH_NO_V4+=("$ns")
             continue
         fi
         for addr in $addrs; do
-            opt="@$addr"
             AUTH_SERVERS+=("$ns ($addr)")
             show_progress "権威DNSサーバーの確認中: $ns ($addr) への直接問い合わせ ..."
-            status=$(dig_cached "$fqdn" "$opt" +norecurse +time=3 +tries=2 +noall +comments | grep -ioE "status: [A-Z]+" | awk '{print toupper($2)}')
-            [ -z "$status" ] && status="TIMEOUT_OR_ERROR"
+            out=$(dns_query A "$fqdn" "$addr" +norecurse)
+            status=$(dns_status "$out")
             AUTH_STATUS+=("$status")
             # 応答しない・拒否するサーバーには、それ以上問い合わせない (タイムアウト待ちを重ねないため)
             if [ "$status" != "NOERROR" ] && [ "$status" != "NXDOMAIN" ]; then
@@ -848,13 +964,10 @@ collect_auth_info() {
                 AUTH_CNAME+=("")
                 continue
             fi
-            serial=$(dig_cached +short SOA "$AUTH_ZONE" "$opt" +norecurse +time=3 +tries=2 | awk 'NR == 1 { print $3 }')
-            caa=$(dig_cached CAA "$fqdn" "$opt" +norecurse +time=3 +tries=2 +noall +answer | awk -v n="$fqdn" '
-                { owner = tolower($1); sub(/\.$/, "", owner) }
-                owner == n && $4 == "CAA" { $1 = $2 = $3 = $4 = ""; sub(/^ +/, ""); print }' | sort | tr '\n' ',' | sed 's/,$//')
-            cname=$(dig_cached CNAME "$fqdn" "$opt" +norecurse +time=3 +tries=2 +noall +answer | awk -v n="$fqdn" '
-                { owner = tolower($1); sub(/\.$/, "", owner) }
-                owner == n && $4 == "CNAME" { v = tolower($5); sub(/\.$/, "", v); print v }' | sort | tr '\n' ',' | sed 's/,$//')
+            # CNAMEは、Aの問い合わせの回答に含まれるもの (CNAMEのノードではサーバーはCNAMEを返す) を使う
+            cname=$(dns_records "$out" CNAME "$fqdn" | normalize_names | tr '\n' ',' | sed 's/,$//')
+            serial=$(dns_records "$(dns_query SOA "$AUTH_ZONE" "$addr" +norecurse)" SOA "$AUTH_ZONE" | awk 'NR == 1 { print $3 }')
+            caa=$(dns_records "$(dns_query CAA "$fqdn" "$addr" +norecurse)" CAA "$fqdn" | sort | tr '\n' ',' | sed 's/,$//')
             AUTH_SERIAL+=("$serial")
             AUTH_CAA+=("$caa")
             AUTH_CNAME+=("$cname")
@@ -867,6 +980,16 @@ collect_auth_info() {
         [ -n "$DELEG_PARENT" ] && AUTH_PARENT_REACHED=$DELEG_REACHED
     fi
     show_progress
+}
+
+# NS名のIPv4アドレスを出力する。再帰リゾルバで引けなければ、親ゾーンのグルー("NS名 アドレス" の行)を使う
+auth_ns_addrs() {
+    local ns=$1 glue=$2 addrs
+    addrs=$(dns_records "$(dns_query A "$ns" "")" A | grep -E '^[0-9]+(\.[0-9]+){3}$')
+    if [ -z "$addrs" ] && [ -n "$glue" ]; then
+        addrs=$(echo "$glue" | awk -v n="$ns" '$1 == n { print $2 }')
+    fi
+    echo "$addrs"
 }
 
 # 直接問い合わせた権威DNSサーバーのうち、1台でも応答(NOERROR / NXDOMAIN)したかを返す
@@ -952,6 +1075,7 @@ ACME_CHAL_TXT=""      # _acme-challenge.<FQDN> に残っているTXTレコード
 ACME_PUBLIC_ADDRS=""  # CAから接続できるアドレス (A / AAAA)
 ACME_PUBLIC_V6=""     # そのうちIPv6のアドレス
 ACME_PRIVATE_ADDRS="" # プライベートアドレスなど、CAから接続できないアドレス
+ACME_SKIPPED=""       # 対象FQDN自体の名前解決にパブリックDNSの両方で失敗したため確認を省いたときの、そのステータス
 
 # UPKIのACMEで使える検証方式(dns-01 / http-01)が、DNSの面で使えるかを確かめるための情報を集める。
 # CAはインターネット上から確認するため、パブリックDNS (8.8.8.8 / 1.1.1.1) に問い合わせる。
@@ -959,6 +1083,8 @@ ACME_PRIVATE_ADDRS="" # プライベートアドレスなど、CAから接続で
 #   今はなくても(NXDOMAINでも)よい)。CNAMEで委任している場合は、参照先が存在することも確かめる
 # - http-01: FQDNに、CAが接続できるアドレス(A / AAAA)があること
 #   (CDNなどではDNSサーバーごとに違うアドレスを返すのが普通なので、アドレスはDNSサーバー間で比べず、両方の結果を合わせる)
+# - 対象FQDN自体の名前解決に両方のパブリックDNSで失敗したときは、その配下やアドレスも引けないため問い合わせない
+#   (権威DNSサーバーが応答しないドメインで、タイムアウトを重ねて待たないため)
 collect_acme_info() {
     local fqdn=$1
     [ "$ACME_FQDN" == "$fqdn" ] && return
@@ -972,33 +1098,43 @@ collect_acme_info() {
     ACME_PUBLIC_ADDRS=""
     ACME_PUBLIC_V6=""
     ACME_PRIVATE_ADDRS=""
+    ACME_SKIPPED=""
+
+    local dns status skipped="" ok=0
+    for dns in 8.8.8.8 1.1.1.1; do
+        status=$(dns_status "$(dns_query A "$fqdn" "$dns")")
+        skipped="${skipped:+$skipped, }$dns=$status"
+        is_resolved_status "$status" && ok=1
+    done
+    if [ $ok -eq 0 ]; then
+        ACME_SKIPPED=$skipped
+        return
+    fi
 
     local name="_acme-challenge.$fqdn"
-    local dns status first_status=""
+    local out first_out=""
     for dns in 8.8.8.8 1.1.1.1; do
         show_progress "ACME向けの確認中: dns-01 ($name を $dns で確認) ..."
-        status=$(dig_cached TXT "$name" "@$dns" +time=3 +tries=2 +noall +comments | grep -ioE "status: [A-Z]+" | awk '{print toupper($2)}')
-        [ -z "$status" ] && status="TIMEOUT_OR_ERROR"
-        [ -z "$first_status" ] && first_status=$status
+        out=$(dns_query TXT "$name" "$dns")
+        [ -z "$first_out" ] && first_out=$out
+        status=$(dns_status "$out")
         ACME_CHAL_STATUS="${ACME_CHAL_STATUS:+$ACME_CHAL_STATUS, }$dns=$status"
-        if [ "$status" != "NOERROR" ] && [ "$status" != "NXDOMAIN" ]; then
-            ACME_CHAL_BAD=1
-        fi
+        is_resolved_status "$status" || ACME_CHAL_BAD=1
     done
-    show_progress "ACME向けの確認中: dns-01 ($name のCNAME・TXT) ..."
-    ACME_CHAL_CNAME=$(dig_cached +short CNAME "$name" @8.8.8.8 +time=3 +tries=2 | head -n 1 | sed 's/\.$//')
+    # CNAMEと残っているTXTは、8.8.8.8 へのTXTの問い合わせの回答から取り出す
+    ACME_CHAL_CNAME=$(dns_records "$first_out" CNAME "$name" | head -n 1 | normalize_names)
     # CNAMEがあるのにTXTの問い合わせがNXDOMAINなら、参照先が存在しない
-    if [ -n "$ACME_CHAL_CNAME" ] && [ "$first_status" == "NXDOMAIN" ]; then
+    if [ -n "$ACME_CHAL_CNAME" ] && [ "$(dns_status "$first_out")" == "NXDOMAIN" ]; then
         ACME_CHAL_DANGLING=1
     fi
-    ACME_CHAL_TXT=$(dig_cached +short TXT "$name" @8.8.8.8 +time=3 +tries=2 | grep '^"' | tr '\n' ',' | sed 's/,$//; s/,/, /g')
+    ACME_CHAL_TXT=$(dns_records "$first_out" TXT | grep '^"' | tr '\n' ',' | sed 's/,$//; s/,/, /g')
 
     local addrs addr
     # (進捗の表示は標準エラー出力なので、$(...) の中からでも表示される)
     addrs=$(for dns in 8.8.8.8 1.1.1.1; do
         show_progress "ACME向けの確認中: http-01 ($fqdn のA / AAAAを $dns で確認) ..."
-        dig_cached +short A "$fqdn" "@$dns" +time=3 +tries=2 | grep -E '^[0-9]+(\.[0-9]+){3}$'
-        dig_cached +short AAAA "$fqdn" "@$dns" +time=3 +tries=2 | grep ':'
+        dns_records "$(dns_query A "$fqdn" "$dns")" A | grep -E '^[0-9]+(\.[0-9]+){3}$'
+        dns_records "$(dns_query AAAA "$fqdn" "$dns")" AAAA | grep ':'
     done | sort -u)
     show_progress
     for addr in $addrs; do
@@ -1013,14 +1149,18 @@ collect_acme_info() {
 
 # dns-01 で発行できない理由を出力する (発行できれば何も出力しない)
 acme_dns01_problem() {
-    if [ "$ACME_CHAL_BAD" == "1" ]; then
+    if [ -n "$ACME_SKIPPED" ]; then
+        echo "$ACME_FQDN 自体の名前解決に失敗しているため確認していません ($ACME_SKIPPED)"
+    elif [ "$ACME_CHAL_BAD" == "1" ]; then
         echo "_acme-challenge.$ACME_FQDN の名前解決に失敗しました ($ACME_CHAL_STATUS)"
     fi
 }
 
 # http-01 で発行できない理由を出力する (発行できれば何も出力しない)
 acme_http01_problem() {
-    if [ -z "$ACME_PUBLIC_ADDRS" ] && [ -z "$ACME_PRIVATE_ADDRS" ]; then
+    if [ -n "$ACME_SKIPPED" ]; then
+        echo "$ACME_FQDN 自体の名前解決に失敗しているため確認していません ($ACME_SKIPPED)"
+    elif [ -z "$ACME_PUBLIC_ADDRS" ] && [ -z "$ACME_PRIVATE_ADDRS" ]; then
         echo "Aレコード・AAAAレコードがありません"
     elif [ -z "$ACME_PUBLIC_ADDRS" ]; then
         echo "アドレスがすべてプライベートアドレスのため、CAが接続できません ($ACME_PRIVATE_ADDRS)"
@@ -1035,6 +1175,13 @@ print_acme_info() {
     local problem
     if [ -n "$ACME_METHOD" ]; then
         echo "--acme-method で指定された検証方式: $ACME_METHOD"
+    fi
+    if [ -n "$ACME_SKIPPED" ]; then
+        echo "$fqdn 自体の名前解決にパブリックDNSで失敗したため、dns-01 / http-01 の確認は省略しました ($ACME_SKIPPED)。"
+        echo "  → どちらの方式も使えません"
+        echo "--- tls-alpn-01 ---"
+        echo "  → UPKIのACMEでは使えません"
+        return
     fi
     echo "--- dns-01 (_acme-challenge.$fqdn) ---"
     echo "  status: $ACME_CHAL_STATUS"
@@ -1817,6 +1964,7 @@ run_check() {
 
     if [ $QUIET -eq 1 ]; then
         [ -n "$label" ] && echo "確認中: $fqdn" >&2
+        prefetch_for_fqdn "$fqdn" 0
         evaluate_mpic "$fqdn" > /dev/null
     else
         if [ -n "$label" ]; then
@@ -1825,6 +1973,7 @@ run_check() {
             echo "# [$fqdn] ($label)"
             echo "##################################################"
         fi
+        prefetch_for_fqdn "$fqdn" 1
         check_one_fqdn "$fqdn"
     fi
 

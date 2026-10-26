@@ -25,7 +25,15 @@
 #     署名の検証を省く +cd を付けると通常どおり解決できる
 #   - CNAME は問い合わせタイプが CNAME 以外ならたどる。名前自身か配下にレコードがなければ NXDOMAIN
 
+#
+# 環境変数 MOCK_DNS_DELAY に秒数を指定すると、タイムアウトと SERVFAIL の応答を返す前にその秒数だけ待つ
+# (応答しないドメインで、待ち時間がどれだけ積み重なるかを確かめるため。テストでは指定しない)
+
+# 環境変数 MOCK_DNS_LOG にファイル名を指定すると、呼び出されたときの引数を1行ずつ追記する
+# (同じ問い合わせを2回実行していないかを確かめるため)
+
 zone=${MOCK_DNS_ZONE:?MOCK_DNS_ZONE が設定されていません}
+[ -n "$MOCK_DNS_LOG" ] && echo "$*" >> "$MOCK_DNS_LOG"
 
 short=0
 cd=0
@@ -147,6 +155,10 @@ if [ $additional -eq 1 ] && [ "$qtype" == "NS" ] && [ "$status" == "NOERROR" ]; 
             [ -n "$addr" ] && answers+="$ns. 300 IN A $addr"$'\n'
         done <<< "$(records "$ns" | awk '$1 == "A" { print $2 }')"
     done <<< "$(records "$current" | awk '$1 == "NS" { print $2 }')"
+fi
+
+if [ -n "$MOCK_DNS_DELAY" ] && { [ "$status" == "TIMEOUT" ] || [ "$status" == "SERVFAIL" ]; }; then
+    sleep "$MOCK_DNS_DELAY"
 fi
 
 if [ "$status" == "TIMEOUT" ]; then
