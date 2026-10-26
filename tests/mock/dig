@@ -5,6 +5,9 @@
 #   dig <name> [@server] +noall +comments   … ステータス(NOERROR / NXDOMAIN / SERVFAIL)の確認
 #   dig +short <type> <name> [@server]      … レコードの値のみ
 #   dig <type> <name> [@server] +noall +answer … 所有者名付きの応答
+#   dig <type> <name> [@server] +noall +comments +answer … ステータスと所有者名付きの応答
+#   dig NS <name> @server +norecurse +noall +comments +answer +authority +additional
+#                                              … 親ゾーンの委任情報 (NSと、そのAレコード(グルー))
 # +time / +tries などそれ以外のオプションは無視する
 #
 # ゾーンファイルの形式 (空白区切り、# 以降はコメント)
@@ -14,6 +17,8 @@
 #   - リゾルバ固有の行では名前に "*" を書くと、そのリゾルバへのすべての問い合わせに効く
 #     (例: "192.0.2.82 * STATUS TIMEOUT" で、応答しない権威DNSサーバーを表す)
 #   - タイプ STATUS は応答ステータスを上書きする (SERVFAIL / NXDOMAIN / REFUSED / TIMEOUT)
+#   - +authority は無視する (委任のNSも回答として出す)。+additional を付けたNSの問い合わせでは、
+#     そのサーバーから見たNS名のAレコードをグルーとして出す
 #   - +norecurse は無視する (権威DNSサーバーもIPアドレスをリゾルバ名として同じように扱う)
 #   - タイプ DNSSEC の値 BOGUS は、そのリゾルバでDNSSECの検証に失敗するゾーンを表す
 #     (例: "8.8.8.8 bogus.ac.jp DNSSEC BOGUS")。ゾーン内と配下の名前は SERVFAIL になり、
@@ -24,7 +29,9 @@ zone=${MOCK_DNS_ZONE:?MOCK_DNS_ZONE が設定されていません}
 
 short=0
 cd=0
-mode=""
+comments=0
+answer=0
+additional=0
 server="default"
 qtype="A"
 qname=""
@@ -32,8 +39,9 @@ for arg in "$@"; do
     case "$arg" in
         +short) short=1 ;;
         +cd) cd=1 ;;
-        +answer) mode="answer" ;;
-        +comments) mode="comments" ;;
+        +answer) answer=1 ;;
+        +comments) comments=1 ;;
+        +additional) additional=1 ;;
         +*) ;;
         @*) server=${arg#@} ;;
         A|AAAA|CAA|CNAME|TXT|NS|SOA|DS|DNSKEY) qtype=$arg ;;
@@ -131,6 +139,16 @@ for _ in 1 2 3 4 5 6 7 8; do
     break
 done
 
+if [ $additional -eq 1 ] && [ "$qtype" == "NS" ] && [ "$status" == "NOERROR" ]; then
+    while read -r ns; do
+        [ -z "$ns" ] && continue
+        ns=$(echo "${ns%.}" | tr '[:upper:]' '[:lower:]')
+        while read -r addr; do
+            [ -n "$addr" ] && answers+="$ns. 300 IN A $addr"$'\n'
+        done <<< "$(records "$ns" | awk '$1 == "A" { print $2 }')"
+    done <<< "$(records "$current" | awk '$1 == "NS" { print $2 }')"
+fi
+
 if [ "$status" == "TIMEOUT" ]; then
     echo ";; connection timed out; no servers could be reached"
     exit 9
@@ -138,8 +156,12 @@ fi
 
 if [ $short -eq 1 ]; then
     printf '%s' "$answers" | awk '{ $1 = $2 = $3 = $4 = ""; sub(/^ +/, ""); print }'
-elif [ "$mode" == "comments" ]; then
-    echo ";; ->>HEADER<<- opcode: QUERY, status: $status, id: 1"
 else
-    printf '%s' "$answers"
+    if [ $comments -eq 1 ]; then
+        echo ";; ->>HEADER<<- opcode: QUERY, status: $status, id: 1"
+    fi
+    # +comments だけのときはステータスのみ (+answer を付けたときか、どちらもないときは応答を出す)
+    if [ $comments -eq 0 ] || [ $answer -eq 1 ]; then
+        printf '%s' "$answers"
+    fi
 fi
