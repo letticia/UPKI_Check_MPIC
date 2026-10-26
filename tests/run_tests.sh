@@ -315,6 +315,20 @@ run_script refused.alpha.ac.jp
 assert_contains "REFUSEDはステータスを表示" "名前解決ができません (status: REFUSED)。" "$RUN_OUTPUT"
 assert_not_contains "REFUSEDをCNAMEの先と誤表示しない" "!REFUSED" "$RUN_OUTPUT"
 
+echo "■ 判定結果の見出し (発行方式別の見通しと食い違わない)"
+run_script ok.alpha.ac.jp
+assert_contains "両方とも発行できれば ✅" "判定結果: ✅ パスする可能性が高いです。" "$RUN_OUTPUT"
+run_script www.bravo.ac.jp
+assert_contains "両方とも発行できなければ ❌" "判定結果: ❌ パスしない（エラーになる）可能性が高いです。" "$RUN_OUTPUT"
+run_script acme-broken.alpha.ac.jp
+assert_contains "ACMEだけ発行できなければ ⚠️" "判定結果: ⚠️  発行方式によって結果が異なります (CSR申請: ✅ / ACME発行: ❌)。" "$RUN_OUTPUT"
+assert_not_contains "ACMEだけ発行できなくても ❌ にしない" "判定結果: ❌" "$RUN_OUTPUT"
+assert_contains "原因は表示する" "・UPKIのACMEで使える検証方式 (dns-01 / http-01) のどちらでも、ACMEで発行できません。" "$RUN_OUTPUT"
+run_script missing.alpha.ac.jp
+assert_contains "NXDOMAIN (CSR要確認・ACME不可) は ⚠️" "判定結果: ⚠️  発行方式によって結果が異なります (CSR申請: ⚠️  / ACME発行: ❌)。" "$RUN_OUTPUT"
+CHECK_MPIC_TODAY="2027-03-15" run_script vm-acme.alpha.ac.jp
+assert_contains "CSRだけ要確認なら ✅ にしない" "判定結果: ⚠️  発行方式によって結果が異なります (CSR申請: ⚠️  / ACME発行: ✅)。" "$RUN_OUTPUT"
+
 echo "■ 判定理由"
 run_script -q missing.alpha.ac.jp
 assert_contains "NXDOMAIN" "すべてのDNSサーバーでNXDOMAIN" "$RUN_OUTPUT"

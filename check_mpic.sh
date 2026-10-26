@@ -1304,7 +1304,6 @@ evaluate_mpic() {
     local rel_1111_caa
     rel_1111_caa=$(echo "$rel_1111" | cut -d'|' -f2)
 
-    local mpic_pass=1
     # 発行方式ごとの見通し (1=問題なし / 2=条件付き / 0=発行できない)
     local csr_state=1
     local acme_state=1
@@ -1323,7 +1322,6 @@ evaluate_mpic() {
     # 1. パブリックDNSでの名前解決失敗(SERVFAIL・REFUSED・無応答など、NOERROR / NXDOMAIN 以外)
     #    SERVFAILはCAAの確認結果も「不明」にするため、MPICの裏付けが取れず両方式とも発行できない
     if ! is_resolved_status "$stat_8888" || ! is_resolved_status "$stat_1111"; then
-        mpic_pass=0
         csr_state=0
         acme_state=0
 
@@ -1380,7 +1378,6 @@ evaluate_mpic() {
     #    一方ACMEはdns-01が _acme-challenge.<FQDN>、http-01/tls-alpn-01がA/AAAAを必要とし、
     #    実質ADNが対象FQDNに固定されるため発行できない。
     if [[ "$stat_8888" == "NXDOMAIN" && "$stat_1111" == "NXDOMAIN" ]]; then
-        mpic_pass=0
         acme_state=0
         [ $csr_state -eq 1 ] && csr_state=2
         if [[ "$stat_def" == "NOERROR" ]]; then
@@ -1404,7 +1401,6 @@ evaluate_mpic() {
         fi
     elif [[ "$stat_8888" == "NXDOMAIN" && "$stat_1111" == "NOERROR" ]] || [[ "$stat_8888" == "NOERROR" && "$stat_1111" == "NXDOMAIN" ]]; then
         # 片方が SERVFAIL などの場合は 1. で判定しているため、ここでは NOERROR と NXDOMAIN に分かれた場合だけを扱う
-        mpic_pass=0
         csr_state=0
         acme_state=0
         fail_reasons+=("・パブリックDNSの間で、NXDOMAIN（存在しない）と解決できる結果に分かれました (Status: 8.8.8.8=$stat_8888, 1.1.1.1=$stat_1111)。")
@@ -1421,7 +1417,6 @@ evaluate_mpic() {
     local def_caa_warned=0  # デフォルトDNSだけCAAが異なることを【注意】にしたか (4. で重ねて指摘しないため)
     if [[ "$stat_8888" == "NOERROR" && "$stat_1111" == "NOERROR" ]]; then
         if [[ "$caa_8888" != "$caa_1111" ]]; then
-            mpic_pass=0
             csr_state=0
             acme_state=0
             fail_reasons+=("・取得されたCAAレコードがパブリックDNSの間で一致しませんでした。")
@@ -1436,7 +1431,6 @@ evaluate_mpic() {
         fi
 
         if [[ "$cname_8888" != "$cname_1111" ]]; then
-            mpic_pass=0
             csr_state=0
             acme_state=0
             fail_reasons+=("・取得されたCNAMEレコードがパブリックDNSの間で一致しませんでした。")
@@ -1477,7 +1471,6 @@ evaluate_mpic() {
         warnings+=("  CAが参照するパブリックDNSでは確認できているため判定には反映しませんが、内部DNSの設定を確認してください。")
     fi
     if [ ${#caa_lookup_ng[@]} -gt 0 ]; then
-        mpic_pass=0
         csr_state=0
         acme_state=0
         local joined
@@ -1515,7 +1508,6 @@ evaluate_mpic() {
         fi
     done
     if [ $caa_ng -eq 1 ]; then
-        mpic_pass=0
         csr_state=0
         acme_state=0
         fail_reasons+=("  [原因推測] CAAはDCVとは別レイヤの許可リストで、発行直前(8時間以内、ACMEではfinalize時)にCAが確認します。")
@@ -1574,7 +1566,6 @@ evaluate_mpic() {
 
             if [ "$(kv_get "$effects" acme_ok)" != "1" ]; then
                 if [ $enforced -eq 1 ]; then
-                    mpic_pass=0
                     acme_state=0
                     fail_reasons+=("・実効CAAレコードの validationmethods ($params) にUPKIのACMEで使える検証方式(dns-01 / http-01)が含まれないため、ACMEでは発行できません。(ドメイン: $param_domain)")
                     fail_reasons+=("  [ACME発行の場合] 2027-03-15以降、CAはvalidationmethodsの処理が必須です(BR 4.2.2.1.2、SC-098)。")
@@ -1623,7 +1614,6 @@ evaluate_mpic() {
         done
 
         if [ -z "$acme_usable" ]; then
-            mpic_pass=0
             acme_state=0
             if [ -n "$ACME_METHOD" ]; then
                 fail_reasons+=("・--acme-method で指定した検証方式 ($ACME_METHOD) では、ACMEで発行できません。")
@@ -1673,7 +1663,6 @@ evaluate_mpic() {
         done
 
         if [ $auth_mismatch -eq 1 ]; then
-            mpic_pass=0
             csr_state=0
             acme_state=0
             fail_reasons+=("・権威DNSサーバー間で応答(ステータス、CAA、CNAME)が一致しませんでした。(ゾーン: $AUTH_ZONE)")
@@ -1722,11 +1711,18 @@ evaluate_mpic() {
         MPIC_WARNING=${warnings[0]#・}
     fi
 
-    if [ $mpic_pass -eq 1 ]; then
+    # 見出しは【発行方式別の見通し】と食い違わないよう、CSR申請とACME発行の判定から決める
+    # (ACMEだけが発行できない場合などに、CSR申請が ✅ なのに見出しが ❌ にならないように)
+    if [ $csr_state -eq 1 ] && [ $acme_state -eq 1 ]; then
         echo "判定結果: ✅ パスする可能性が高いです。"
         echo "パブリックDNS (8.8.8.8 / 1.1.1.1) と権威DNSサーバーからの応答（ステータス、CAA、CNAME）が一致しています。"
-    else
+    elif [ $csr_state -eq 0 ] && [ $acme_state -eq 0 ]; then
         echo "判定結果: ❌ パスしない（エラーになる）可能性が高いです。"
+    else
+        echo "判定結果: ⚠️  発行方式によって結果が異なります (CSR申請: $(state_mark "$csr_state") / ACME発行: $(state_mark "$acme_state"))。"
+        echo "方式ごとの見通しは【発行方式別の見通し】をご参照ください。"
+    fi
+    if [ ${#fail_reasons[@]} -gt 0 ]; then
         echo "以下の原因が考えられます："
         for reason in "${fail_reasons[@]}"; do
             echo "$reason"
@@ -1762,7 +1758,7 @@ evaluate_mpic() {
     esac
     echo "--------------------------------------------------"
 
-    if [ $mpic_pass -eq 0 ]; then
+    if [ ${#fail_reasons[@]} -gt 0 ]; then
         echo ""
         echo "※【発行方式(CSR / ACME)による違い】"
         echo "  ・MPICはACME固有の仕組みではなく、BR 3.2.2.4のすべてのDCV方式(CAAの参照を含む)に適用されます。"
