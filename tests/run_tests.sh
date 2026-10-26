@@ -265,6 +265,30 @@ assert_judgement geo.alpha.ac.jp "❌" "❌"
 assert_judgement slow.alpha.ac.jp "❌" "❌"
 assert_judgement split.alpha.ac.jp "❌" "❌"
 
+echo "■ デフォルトDNSだけの違い (判定はパブリックDNSで行う)"
+assert_judgement intra-cname.alpha.ac.jp "✅" "✅"
+run_script -q intra-cname.alpha.ac.jp
+assert_contains "デフォルトDNSだけのCNAMEは注意" "← 注意: デフォルトDNSとパブリックDNSでCNAMEレコードが一致しません。" "$RUN_OUTPUT"
+assert_judgement intra-missing.alpha.ac.jp "✅" "✅"
+run_script -q intra-missing.alpha.ac.jp
+assert_contains "デフォルトDNSだけのNXDOMAINは注意" "← 注意: デフォルトDNSでだけNXDOMAIN（存在しない）となりました。" "$RUN_OUTPUT"
+assert_judgement intra-caa.alpha.ac.jp "✅" "✅"
+run_script intra-caa.alpha.ac.jp
+assert_contains "デフォルトDNSだけのCAAは注意" "・デフォルトDNSとパブリックDNSでCAAレコードが一致しません。" "$RUN_OUTPUT"
+assert_not_contains "デフォルトDNSだけのCAAを重ねて指摘しない" "・デフォルトDNSで実効的に適用されるCAAレコード" "$RUN_OUTPUT"
+assert_judgement nx-deftimeout.alpha.ac.jp "⚠️" "❌"
+run_script -q nx-deftimeout.alpha.ac.jp
+assert_contains "デフォルトDNSが失敗してもパブリックDNSのNXDOMAINで判定" "← パブリックDNS (8.8.8.8 / 1.1.1.1) でNXDOMAIN（存在しない）となりました。" "$RUN_OUTPUT"
+assert_judgement nx-split.alpha.ac.jp "❌" "❌"
+run_script -q nx-split.alpha.ac.jp
+assert_contains "パブリックDNSの間でNXDOMAINと分かれる" "← パブリックDNSの間で、NXDOMAIN（存在しない）と解決できる結果に分かれました" "$RUN_OUTPUT"
+assert_judgement caa-split.alpha.ac.jp "❌" "❌"
+run_script -q caa-split.alpha.ac.jp
+assert_contains "デフォルトDNSが失敗してもパブリックDNSのCAAを比べる" "← 取得されたCAAレコードがパブリックDNSの間で一致しませんでした。" "$RUN_OUTPUT"
+assert_judgement refused.alpha.ac.jp "❌" "❌"
+run_script -q refused.alpha.ac.jp
+assert_contains "REFUSEDも名前解決の失敗" "8.8.8.8=REFUSED, 1.1.1.1=REFUSED" "$RUN_OUTPUT"
+
 echo "■ 判定理由"
 run_script -q missing.alpha.ac.jp
 assert_contains "NXDOMAIN" "すべてのDNSサーバーでNXDOMAIN" "$RUN_OUTPUT"
@@ -275,7 +299,7 @@ assert_contains "パブリックDNSでのSERVFAIL" "8.8.8.8=SERVFAIL" "$RUN_OUTP
 run_script -q slow.alpha.ac.jp
 assert_contains "パブリックDNSでのタイムアウト" "1.1.1.1=TIMEOUT_OR_ERROR" "$RUN_OUTPUT"
 run_script -q split.alpha.ac.jp
-assert_contains "DNS拠点間のCAAの不一致" "CAAレコードがDNSサーバー間で一致しませんでした" "$RUN_OUTPUT"
+assert_contains "DNS拠点間のCAAの不一致" "CAAレコードがパブリックDNSの間で一致しませんでした" "$RUN_OUTPUT"
 run_script -q www.delta.ac.jp
 assert_contains "元のドメインの親のCAAで判定" "(delta.ac.jp: 0 issue \"letsencrypt.org\")" "$RUN_OUTPUT"
 run_script -q www.foxtrot.ac.jp
@@ -345,7 +369,7 @@ assert_contains "署名なしと表示" "DNSSEC: 署名なし" "$RUN_OUTPUT"
 echo "■ 実効CAAの探索中の問い合わせ失敗"
 assert_judgement www.papa.ac.jp "❌" "❌"
 run_script -q www.papa.ac.jp
-assert_contains "まとめに問い合わせ失敗と表示" "← 実効CAAレコードの探索中に、CAAレコードの問い合わせに失敗しました (デフォルトDNS: papa.ac.jp=SERVFAIL, 8.8.8.8: papa.ac.jp=SERVFAIL, 1.1.1.1: papa.ac.jp=SERVFAIL)" "$RUN_OUTPUT"
+assert_contains "まとめに問い合わせ失敗と表示" "← 実効CAAレコードの探索中に、CAAレコードの問い合わせに失敗しました (8.8.8.8: papa.ac.jp=SERVFAIL, 1.1.1.1: papa.ac.jp=SERVFAIL)" "$RUN_OUTPUT"
 run_script www.papa.ac.jp
 assert_contains "BR 3.2.2.8 への言及" "CAAの確認に失敗すると、CAは原則として発行できません(BR 3.2.2.8)" "$RUN_OUTPUT"
 
