@@ -1085,6 +1085,12 @@ show_progress() {
     fi
 }
 
+# 名前解決の結果が得られた(NOERROR または NXDOMAIN)ステータスかを返す
+# (それ以外の SERVFAIL・REFUSED・TIMEOUT_OR_ERROR などは、問い合わせの失敗)
+is_resolved_status() {
+    [ "$1" == "NOERROR" ] || [ "$1" == "NXDOMAIN" ]
+}
+
 # MPIC判定を行う関数
 # 併せて、検出した不備が「CSRによる申請」「ACMEによる発行」のそれぞれでどう現れるかを分類して出力する。
 evaluate_mpic() {
@@ -1156,12 +1162,20 @@ evaluate_mpic() {
     local csr_state=1
     local acme_state=1
     local fail_reasons=()
+    # 【注意】: 判定には反映しないが確認したほうがよい点
+    local warnings=()
+    # CSR申請が条件付き(⚠️)になったときの「発行方式別の見通し」の説明 (空なら上位ADNのDCVについての説明)
+    local csr_conditional_msg=""
     # 権威DNSサーバーがどれも応答しないことを 1. の原因として指摘したか (5. で重ねて指摘しないため)
     local auth_down_reported=0
 
-    # 1. パブリックDNSでの名前解決失敗(SERVFAIL/無応答)
+    # ※ 判定はCAと同じくインターネット上から見えるパブリックDNS (8.8.8.8 / 1.1.1.1) の結果で行う。
+    #   デフォルトDNS(この端末が使う、学内などの内部DNSのことが多い)はCAの観測点ではないため、
+    #   デフォルトDNSだけの食い違いや失敗は【注意】にとどめる
+
+    # 1. パブリックDNSでの名前解決失敗(SERVFAIL・REFUSED・無応答など、NOERROR / NXDOMAIN 以外)
     #    SERVFAILはCAAの確認結果も「不明」にするため、MPICの裏付けが取れず両方式とも発行できない
-    if [[ "$stat_8888" == "SERVFAIL" || "$stat_8888" == "TIMEOUT_OR_ERROR" || "$stat_1111" == "SERVFAIL" || "$stat_1111" == "TIMEOUT_OR_ERROR" ]]; then
+    if ! is_resolved_status "$stat_8888" || ! is_resolved_status "$stat_1111"; then
         mpic_pass=0
         csr_state=0
         acme_state=0
@@ -1218,55 +1232,74 @@ evaluate_mpic() {
     #    対して行われるため、CSR方式では上位ADNのDCV結果が再利用され発行され得る。
     #    一方ACMEはdns-01が _acme-challenge.<FQDN>、http-01/tls-alpn-01がA/AAAAを必要とし、
     #    実質ADNが対象FQDNに固定されるため発行できない。
-    if [[ "$stat_def" == "NXDOMAIN" || "$stat_8888" == "NXDOMAIN" || "$stat_1111" == "NXDOMAIN" ]]; then
+    if [[ "$stat_8888" == "NXDOMAIN" && "$stat_1111" == "NXDOMAIN" ]]; then
         mpic_pass=0
-        if [[ "$stat_def" == "NXDOMAIN" && "$stat_8888" == "NXDOMAIN" && "$stat_1111" == "NXDOMAIN" ]]; then
-            acme_state=0
-            [ $csr_state -eq 1 ] && csr_state=2
+        acme_state=0
+        [ $csr_state -eq 1 ] && csr_state=2
+        if [[ "$stat_def" == "NOERROR" ]]; then
+            fail_reasons+=("・デフォルトDNSでは解決できますが、パブリックDNSでNXDOMAIN（存在しない）となりました。")
+            fail_reasons+=("  [原因推測] 内部ネットワーク専用のDNS（スプリットホライズン）で解決されており、外部インターネットから該当ドメインが見えていません。")
+            fail_reasons+=("  [ACME発行の場合] 発行できません。CAは外部からしか参照しないため、チャレンジ用レコードを外部の権威DNSに公開する必要があります。")
+            fail_reasons+=("  [CSR申請の場合]  DCVは対象FQDNではなくADN(上位ドメイン)に対して行われるため、対象FQDNが外部から見えなくても、")
+            fail_reasons+=("                   上位ADNでDCV済みかつCAAが適切であれば発行され得ます。")
+        elif [[ "$stat_def" == "NXDOMAIN" ]]; then
             fail_reasons+=("・すべてのDNSサーバーでNXDOMAIN（名前解決失敗）となりました。")
+        else
+            fail_reasons+=("・パブリックDNS (8.8.8.8 / 1.1.1.1) でNXDOMAIN（存在しない）となりました。(デフォルトDNS: $stat_def)")
+        fi
+        if [[ "$stat_def" != "NOERROR" ]]; then
             fail_reasons+=("  [ACME発行の場合] 発行できません。dns-01のチャレンジは _acme-challenge.$fqdn に置く必要がありますが、")
             fail_reasons+=("                   RFC 8020によりNXDOMAINのFQDN配下の名前も存在しないため参照できません。http-01/tls-alpn-01もA/AAAAが必要です。")
             fail_reasons+=("  [CSR申請の場合]  直ちに発行不可とは限りません。DCVは対象FQDNではなくADN(上位ドメイン)に対して行われるため、")
             fail_reasons+=("                   上位ADNでDCV済みかつCAAが適切であれば、対象FQDNがNXDOMAINでも発行され得ます。")
             fail_reasons+=("                   ただしDCVの再利用可能期間は2026-03-15以降200日に短縮されており(2027-03-15に100日、2029-03-15に10日)、")
             fail_reasons+=("                   再検証のタイミングでは上位ADN側が解決できる必要があります。")
-        elif [[ "$stat_def" == "NOERROR" ]]; then
-            acme_state=0
-            [ $csr_state -eq 1 ] && csr_state=2
-            fail_reasons+=("・デフォルトDNSでは解決できますが、パブリックDNSでNXDOMAIN（存在しない）となりました。")
-            fail_reasons+=("  [原因推測] 内部ネットワーク専用のDNS（スプリットホライズン）で解決されており、外部インターネットから該当ドメインが見えていません。")
-            fail_reasons+=("  [ACME発行の場合] 発行できません。CAは外部からしか参照しないため、チャレンジ用レコードを外部の権威DNSに公開する必要があります。")
-            fail_reasons+=("  [CSR申請の場合]  対象FQDNが外部から見えなくても、上位ADNでDCV済みかつCAAが適切であれば発行され得ます(上記と同じ理由)。")
-        else
-            csr_state=0
-            acme_state=0
-            fail_reasons+=("・一部のDNSサーバーでNXDOMAIN（名前解決失敗）となりました (Status: Default=$stat_def, 8.8.8.8=$stat_8888, 1.1.1.1=$stat_1111)。")
-            fail_reasons+=("  [CSR申請/ACME発行に共通] 観測点によって応答が異なるためMPICの裏付け(quorum)が取れず、どちらの方式でも発行が抑制されます。")
         fi
+    elif [[ "$stat_8888" == "NXDOMAIN" && "$stat_1111" == "NOERROR" ]] || [[ "$stat_8888" == "NOERROR" && "$stat_1111" == "NXDOMAIN" ]]; then
+        # 片方が SERVFAIL などの場合は 1. で判定しているため、ここでは NOERROR と NXDOMAIN に分かれた場合だけを扱う
+        mpic_pass=0
+        csr_state=0
+        acme_state=0
+        fail_reasons+=("・パブリックDNSの間で、NXDOMAIN（存在しない）と解決できる結果に分かれました (Status: 8.8.8.8=$stat_8888, 1.1.1.1=$stat_1111)。")
+        fail_reasons+=("  [原因推測] レコードの追加・削除の直後でキャッシュが残っているか、権威DNSサーバー間で応答が異なっています。")
+        fail_reasons+=("  [CSR申請/ACME発行に共通] 観測点によって応答が異なるためMPICの裏付け(quorum)が取れず、どちらの方式でも発行が抑制されます。")
+    elif [[ "$stat_def" == "NXDOMAIN" && "$stat_8888" == "NOERROR" && "$stat_1111" == "NOERROR" ]]; then
+        warnings+=("・デフォルトDNSでだけNXDOMAIN（存在しない）となりました。パブリックDNSでは解決できます。")
+        warnings+=("  CAはインターネット上から確認するため判定には反映しませんが、内部DNS（スプリットホライズン）にレコードの登録漏れがないか確認してください。")
     fi
 
-    # 3. レコードの不一致 (MPICの裏付けが取れないため方式によらず発行できない)
-    if [[ "$stat_def" == "NOERROR" && "$stat_8888" == "NOERROR" && "$stat_1111" == "NOERROR" ]]; then
-        if [[ "$caa_def" != "$caa_8888" || "$caa_8888" != "$caa_1111" ]]; then
+    # 3. レコードの不一致
+    #    パブリックDNSの間で食い違えば、MPICの裏付けが取れないため方式によらず発行できない。
+    #    デフォルトDNSだけが食い違う場合は、CAからは見えない内部DNSの違いなので【注意】にとどめる
+    local def_caa_warned=0  # デフォルトDNSだけCAAが異なることを【注意】にしたか (4. で重ねて指摘しないため)
+    if [[ "$stat_8888" == "NOERROR" && "$stat_1111" == "NOERROR" ]]; then
+        if [[ "$caa_8888" != "$caa_1111" ]]; then
             mpic_pass=0
             csr_state=0
             acme_state=0
-            fail_reasons+=("・取得されたCAAレコードがDNSサーバー間で一致しませんでした。")
-            fail_reasons+=("  (Default: '$caa_def', 8.8.8.8: '$caa_8888', 1.1.1.1: '$caa_1111')")
+            fail_reasons+=("・取得されたCAAレコードがパブリックDNSの間で一致しませんでした。")
+            fail_reasons+=("  (8.8.8.8: '$caa_8888', 1.1.1.1: '$caa_1111')")
             fail_reasons+=("  [原因推測] ネットワーク環境によって異なるレコードを返しているか、DNS権威サーバー間で同期遅延が発生しています。")
             fail_reasons+=("  [CSR申請/ACME発行に共通] CAAの参照もMPICの対象です(BGPハイジャックによるCAA迂回を防ぐため)。")
             fail_reasons+=("                           観測点ごとに応答が食い違うと裏付けが取れず、どちらの方式でも発行できません。")
+        elif [[ "$stat_def" == "NOERROR" && "$caa_def" != "$caa_8888" ]]; then
+            def_caa_warned=1
+            warnings+=("・デフォルトDNSとパブリックDNSでCAAレコードが一致しません。(Default: '$caa_def', パブリックDNS: '$caa_8888')")
+            warnings+=("  CAが参照するパブリックDNSの間では一致しているため判定には反映しませんが、内部DNSのCAAが外部と異なっていないか確認してください。")
         fi
 
-        if [[ "$cname_def" != "$cname_8888" || "$cname_8888" != "$cname_1111" ]]; then
+        if [[ "$cname_8888" != "$cname_1111" ]]; then
             mpic_pass=0
             csr_state=0
             acme_state=0
-            fail_reasons+=("・取得されたCNAMEレコードがDNSサーバー間で一致しませんでした。")
-            fail_reasons+=("  (Default: '$cname_def', 8.8.8.8: '$cname_8888', 1.1.1.1: '$cname_1111')")
+            fail_reasons+=("・取得されたCNAMEレコードがパブリックDNSの間で一致しませんでした。")
+            fail_reasons+=("  (8.8.8.8: '$cname_8888', 1.1.1.1: '$cname_1111')")
             fail_reasons+=("  [CSR申請の場合]  CNAME先が変わるとCAAの探索経路とADNの導出も変わるため、検証が安定せず発行できません。")
             fail_reasons+=("                   なお2026-11-15に適用期限を迎えるSC-101v2でCNAME追跡とラベル削除の順序が厳格化されます。")
             fail_reasons+=("  [ACME発行の場合] 観測点ごとに参照されるレコードが変わり、authorizationがinvalidになります。")
+        elif [[ "$stat_def" == "NOERROR" && "$cname_def" != "$cname_8888" ]]; then
+            warnings+=("・デフォルトDNSとパブリックDNSでCNAMEレコードが一致しません。(Default: '$cname_def', パブリックDNS: '$cname_8888')")
+            warnings+=("  内部DNS（スプリットホライズン）で別のホストを指していると考えられます。CAはパブリックDNSの結果で確認するため判定には反映しません。")
         fi
     fi
 
@@ -1275,21 +1308,27 @@ evaluate_mpic() {
     #      上位ドメインへ遡って探すのは仕様どおりの正常動作(NXDOMAINは障害にならない)。方式によらず発行を左右する。
     #    ※ 対象ドメイン自身に空でないCAAが見つかればそこで探索を打ち切るため、
     #      無関係な上位ドメインのCAAレコードが誤って判定に影響することはない
-    #    ※ 3拠点で同じ実効CAAが得られた場合は、同じ指摘を3回繰り返さず1件にまとめる
+    #    ※ パブリックDNSの2拠点で同じ実効CAAが得られた場合は、同じ指摘を繰り返さず1件にまとめる
     #    ※ 探索の途中で問い合わせに失敗した拠点は実効CAAが不明のため、許可の確認から除き、失敗として別に指摘する
+    #    ※ デフォルトDNSだけで問い合わせに失敗したり発行が許可されなかったりする場合は【注意】にとどめる
 
     # 4-1. 実効CAAの探索中の問い合わせ失敗
-    #    対象FQDN自体の名前解決に失敗した拠点は 1. で判定している(デフォルトDNSは判定の対象外としている)ため、重ねて指摘しない
+    #    対象FQDN自体の名前解決に失敗した拠点は 1. で判定しているため、重ねて指摘しない
     local caa_lookup_ng=() i
-    local rel_all=("$rel_def" "$rel_8888" "$rel_1111")
-    local stat_all=("$stat_def" "$stat_8888" "$stat_1111")
-    local dns_names=("デフォルトDNS" "8.8.8.8" "1.1.1.1")
-    for (( i=0; i<3; i++ )); do
-        [[ "${rel_all[i]}" == "!"* ]] || continue
-        [[ "${stat_all[i]}" == "NOERROR" || "${stat_all[i]}" == "NXDOMAIN" ]] || continue
-        local failed_domain=${rel_all[i]%%|*}
-        caa_lookup_ng+=("${dns_names[i]}: ${failed_domain#!}=${rel_all[i]#*|}")
+    local rel_pub=("$rel_8888" "$rel_1111")
+    local stat_pub=("$stat_8888" "$stat_1111")
+    local pub_names=("8.8.8.8" "1.1.1.1")
+    for (( i=0; i<2; i++ )); do
+        [[ "${rel_pub[i]}" == "!"* ]] || continue
+        is_resolved_status "${stat_pub[i]}" || continue
+        local failed_domain=${rel_pub[i]%%|*}
+        caa_lookup_ng+=("${pub_names[i]}: ${failed_domain#!}=${rel_pub[i]#*|}")
     done
+    if [[ "$rel_def" == "!"* ]] && is_resolved_status "$stat_def" && [ ${#caa_lookup_ng[@]} -eq 0 ] \
+        && [[ "$rel_8888" != "!"* && "$rel_1111" != "!"* ]]; then
+        warnings+=("・デフォルトDNSでだけ、実効CAAレコードの探索中にCAAレコードの問い合わせに失敗しました (${rel_def_domain#!}=$rel_def_caa)。")
+        warnings+=("  CAが参照するパブリックDNSでは確認できているため判定には反映しませんが、内部DNSの設定を確認してください。")
+    fi
     if [ ${#caa_lookup_ng[@]} -gt 0 ]; then
         mpic_pass=0
         csr_state=0
@@ -1304,15 +1343,19 @@ evaluate_mpic() {
 
     local caa_ng=0
     local rel_labels rel_domains rel_caas suffix reason
-    if [ "$rel_def" == "$rel_8888" ] && [ "$rel_8888" == "$rel_1111" ]; then
+    if [ "$rel_8888" == "$rel_1111" ]; then
         rel_labels=("")
-        rel_domains=("$rel_def_domain")
-        rel_caas=("$rel_def_caa")
-        suffix="(全DNS拠点で共通)"
+        rel_domains=("$rel_8888_domain")
+        rel_caas=("$rel_8888_caa")
+        if [ "$rel_def" == "$rel_8888" ]; then
+            suffix="(全DNS拠点で共通)"
+        else
+            suffix="(パブリックDNSで共通)"
+        fi
     else
-        rel_labels=("デフォルトDNSで" "8.8.8.8で" "1.1.1.1で")
-        rel_domains=("$rel_def_domain" "$rel_8888_domain" "$rel_1111_domain")
-        rel_caas=("$rel_def_caa" "$rel_8888_caa" "$rel_1111_caa")
+        rel_labels=("8.8.8.8で" "1.1.1.1で")
+        rel_domains=("$rel_8888_domain" "$rel_1111_domain")
+        rel_caas=("$rel_8888_caa" "$rel_1111_caa")
         suffix=""
     fi
     for (( i=0; i<${#rel_labels[@]}; i++ )); do
@@ -1332,11 +1375,14 @@ evaluate_mpic() {
         fail_reasons+=("  [CSR申請の場合]  上位ADNでのDCVが済んでいても、CAAで拒否されるため発行できません。")
         fail_reasons+=("  [ACME発行の場合] チャレンジ検証に成功しても、finalize時のCAA確認で拒否され発行できません。")
     fi
-
-    # 【注意】: 判定には反映しないが確認したほうがよい点
-    local warnings=()
-    # CSR申請が条件付き(⚠️)になったときの「発行方式別の見通し」の説明 (空なら上位ADNのDCVについての説明)
-    local csr_conditional_msg=""
+    # デフォルトDNSでだけ異なる実効CAAが得られ、それが発行を許可していない場合
+    if [ $caa_ng -eq 0 ] && [ $def_caa_warned -eq 0 ] && [ "$rel_def" != "$rel_8888" ] && [ -n "$rel_def_domain" ] && [[ "$rel_def_domain" != "!"* ]]; then
+        reason=$(caa_denial_reason "$rel_def_caa")
+        if [ -n "$reason" ]; then
+            warnings+=("・デフォルトDNSで実効的に適用されるCAAレコード ($rel_def_domain: $rel_def_caa) では $CA_DOMAIN による発行が許可されていません。")
+            warnings+=("  CAが参照するパブリックDNSでは許可されているため判定には反映しませんが、内部DNSのCAAが外部と異なっていないか確認してください。")
+        fi
+    fi
 
     # 4-2. 実効CAAレコードの RFC 8657 パラメータ (accounturi / validationmethods)
     #    BR 4.2.2.1.2 (SC-098) により、2027-03-15 からCAはこれらのパラメータの処理が必須になる。
@@ -1531,7 +1577,7 @@ evaluate_mpic() {
 
     if [ $mpic_pass -eq 1 ]; then
         echo "判定結果: ✅ パスする可能性が高いです。"
-        echo "複数のDNS拠点と権威DNSサーバーからの応答（ステータス、CAA、CNAME）が一致しています。"
+        echo "パブリックDNS (8.8.8.8 / 1.1.1.1) と権威DNSサーバーからの応答（ステータス、CAA、CNAME）が一致しています。"
     else
         echo "判定結果: ❌ パスしない（エラーになる）可能性が高いです。"
         echo "以下の原因が考えられます："

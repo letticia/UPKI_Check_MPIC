@@ -55,6 +55,33 @@
 *  split.alpha.ac.jp  CAA  0 issue "secomtrust.net"
 1.1.1.1  split.alpha.ac.jp  A  192.0.2.10
 1.1.1.1  split.alpha.ac.jp  CAA  0 issue "letsencrypt.org"
+# 判定はパブリックDNSで行い、デフォルトDNSだけの違いは【注意】にとどめる
+# デフォルトDNSでだけCNAMEで内部のホストを指す → 判定は可、【注意】
+*  intra-cname.alpha.ac.jp  A  192.0.2.201
+default  intra-cname.alpha.ac.jp  CNAME  intra-host.alpha.ac.jp
+default  intra-host.alpha.ac.jp  A  10.9.9.9
+# デフォルトDNSでだけNXDOMAIN (内部DNSの登録漏れ) → 判定は可、【注意】
+*  intra-missing.alpha.ac.jp  A  192.0.2.202
+default  intra-missing.alpha.ac.jp  STATUS  NXDOMAIN
+# デフォルトDNSでだけCAAが別のCAを許可 → 判定は可、【注意】
+*  intra-caa.alpha.ac.jp  A  192.0.2.207
+default  intra-caa.alpha.ac.jp  A  192.0.2.207
+default  intra-caa.alpha.ac.jp  CAA  0 issue "letsencrypt.org"
+# デフォルトDNSはタイムアウト、パブリックDNSはNXDOMAIN → CSR要確認、ACME不可
+default  nx-deftimeout.alpha.ac.jp  STATUS  TIMEOUT
+# パブリックDNSの間で NXDOMAIN と NOERROR に分かれる → 不可
+*  nx-split.alpha.ac.jp  A  192.0.2.204
+8.8.8.8  nx-split.alpha.ac.jp  STATUS  NXDOMAIN
+# デフォルトDNSはタイムアウト、パブリックDNSの間でCAAが異なる → 不可 (デフォルトDNSが失敗しても比べる)
+*  caa-split.alpha.ac.jp  A  192.0.2.205
+*  caa-split.alpha.ac.jp  CAA  0 issue "secomtrust.net"
+default  caa-split.alpha.ac.jp  STATUS  TIMEOUT
+1.1.1.1  caa-split.alpha.ac.jp  A  192.0.2.205
+1.1.1.1  caa-split.alpha.ac.jp  CAA  0 issue "secomtrust.net",0 iodef "mailto:sec@alpha.ac.jp"
+# パブリックDNSが REFUSED → 不可 (SERVFAIL・タイムアウト以外の失敗も名前解決の失敗とする)
+*  refused.alpha.ac.jp  A  192.0.2.206
+8.8.8.8  refused.alpha.ac.jp  STATUS  REFUSED
+1.1.1.1  refused.alpha.ac.jp  STATUS  REFUSED
 # 内部DNSでのみ解決できる (スプリットホライズン)
 default  internal.alpha.ac.jp  A  10.0.0.1
 8.8.8.8  internal.alpha.ac.jp  STATUS  NXDOMAIN
