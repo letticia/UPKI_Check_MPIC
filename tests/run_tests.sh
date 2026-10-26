@@ -176,6 +176,16 @@ assert_eq "同じ問い合わせは1回だけ実行する" "2" "$(wc -l < "$WORK
 unset -f dig
 DIG_CACHE_DIR=""
 
+echo "■ dns_status / dns_records"
+DNS_OUT=$(dns_query A www.echo.ac.jp "")
+assert_eq "ステータス" "NOERROR" "$(dns_status "$DNS_OUT")"
+assert_eq "応答がなければ TIMEOUT_OR_ERROR" "TIMEOUT_OR_ERROR" "$(dns_status ";; connection timed out; no servers could be reached")"
+assert_eq "CNAMEの参照先のレコードも含む" "198.51.100.3" "$(dns_records "$DNS_OUT" A)"
+assert_eq "所有者名で絞る" "echo-host.net." "$(dns_records "$DNS_OUT" CNAME WWW.Echo.ac.jp.)"
+assert_eq "所有者名が違えば出さない" "" "$(dns_records "$DNS_OUT" A www.echo.ac.jp)"
+assert_eq "eTLD+1 から下へ並べる" "alpha.ac.jp ok.alpha.ac.jp x.ok.alpha.ac.jp" "$(names_from_etld1 x.ok.alpha.ac.jp alpha.ac.jp | tr '\n' ' ' | sed 's/ $//')"
+assert_eq "TLDまで並べる" "ok.alpha.ac.jp alpha.ac.jp ac.jp jp" "$(names_to_tld ok.alpha.ac.jp | tr '\n' ' ' | sed 's/ $//')"
+
 echo "■ find_relevant_caa"
 assert_eq "親ドメインのCAA" 'alpha.ac.jp|0 issue "secomtrust.net"' "$(find_relevant_caa ok.alpha.ac.jp "")"
 assert_eq "自身のCAAが優先" 'own.bravo.ac.jp|0 issue "secomtrust.net"' "$(find_relevant_caa own.bravo.ac.jp "")"
@@ -288,6 +298,22 @@ assert_contains "デフォルトDNSが失敗してもパブリックDNSのCAAを
 assert_judgement refused.alpha.ac.jp "❌" "❌"
 run_script -q refused.alpha.ac.jp
 assert_contains "REFUSEDも名前解決の失敗" "8.8.8.8=REFUSED, 1.1.1.1=REFUSED" "$RUN_OUTPUT"
+
+echo "■ 問い合わせの先読みと使い回し"
+# 先読み(並列)と、その後の順の処理とで、同じ問い合わせを2回実行しないこと (問い合わせの形がそろっていること)
+for host in ok.alpha.ac.jp www.delta.ac.jp www.kilo.ac.jp www.quebec.co.jp acme-delegated.alpha.ac.jp; do
+    for opt in "" -q; do
+        rm -f "$WORK_DIR/dns.log"
+        MOCK_DNS_LOG="$WORK_DIR/dns.log" "$SCRIPT" $opt "$host" > /dev/null 2>&1
+        assert_eq "同じ問い合わせは1回だけ: $host ${opt:-(詳細表示)}" "" "$(sort "$WORK_DIR/dns.log" | uniq -d)"
+    done
+done
+run_script www.quebec.co.jp
+assert_contains "対象FQDNが引けなければACMEの確認を省く" "www.quebec.co.jp 自体の名前解決にパブリックDNSで失敗したため、dns-01 / http-01 の確認は省略しました (8.8.8.8=SERVFAIL, 1.1.1.1=SERVFAIL)。" "$RUN_OUTPUT"
+assert_not_contains "省いたときは _acme-challenge を表示しない" "--- dns-01 (_acme-challenge.www.quebec.co.jp) ---" "$RUN_OUTPUT"
+run_script refused.alpha.ac.jp
+assert_contains "REFUSEDはステータスを表示" "名前解決ができません (status: REFUSED)。" "$RUN_OUTPUT"
+assert_not_contains "REFUSEDをCNAMEの先と誤表示しない" "!REFUSED" "$RUN_OUTPUT"
 
 echo "■ 判定理由"
 run_script -q missing.alpha.ac.jp
