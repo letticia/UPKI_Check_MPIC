@@ -127,6 +127,32 @@ default  internal.alpha.ac.jp  A  10.0.0.1
 *  ns1.november-dns.net  A  192.0.2.91
 192.0.2.91  *  STATUS  TIMEOUT
 
+# ゾーンの権威DNSサーバーがすべて応答しない → 再帰リゾルバではNSも引けないため、親ゾーン(co.jp)の委任情報から特定する
+# NS名のアドレスもゾーン内にあり再帰リゾルバでは引けないため、親ゾーンのグルーを使う
+*  co.jp  NS  ns.parent-dns.example
+*  www.quebec.co.jp  A  192.0.2.26
+*  quebec.co.jp  NS  ns1.quebec.co.jp
+*  quebec.co.jp  NS  ns2.quebec.co.jp
+*  ns1.quebec.co.jp  A  192.0.2.101
+*  ns2.quebec.co.jp  A  192.0.2.102
+192.0.2.101  *  STATUS  TIMEOUT
+192.0.2.102  *  STATUS  TIMEOUT
+default  www.quebec.co.jp  STATUS  TIMEOUT
+8.8.8.8  www.quebec.co.jp  STATUS  SERVFAIL
+1.1.1.1  www.quebec.co.jp  STATUS  SERVFAIL
+default  quebec.co.jp  STATUS  TIMEOUT
+8.8.8.8  quebec.co.jp  STATUS  SERVFAIL
+1.1.1.1  quebec.co.jp  STATUS  SERVFAIL
+default  ns1.quebec.co.jp  STATUS  TIMEOUT
+default  ns2.quebec.co.jp  STATUS  TIMEOUT
+8.8.8.8  _acme-challenge.www.quebec.co.jp  STATUS  SERVFAIL
+1.1.1.1  _acme-challenge.www.quebec.co.jp  STATUS  SERVFAIL
+# 権威DNSサーバーはどれも応答しないが、パブリックDNSはキャッシュから応答する → 判定は可、【注意】(この端末の通信の制限ではない)
+*  www.romeo.co.jp  A  192.0.2.27
+*  romeo.co.jp  NS  ns1.romeo-dns.net
+*  ns1.romeo-dns.net  A  192.0.2.111
+192.0.2.111  *  STATUS  TIMEOUT
+
 # --- DNSSEC ---
 # alpha.ac.jp は署名済み (親ゾーンにDSレコードがあり、検証に成功する)
 *  alpha.ac.jp  DS  12345 13 2 0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF
@@ -140,6 +166,11 @@ default  internal.alpha.ac.jp  A  10.0.0.1
 *  oscar.ac.jp  DS  54321 13 2 FEDCBA9876543210FEDCBA9876543210FEDCBA9876543210FEDCBA9876543210
 8.8.8.8  oscar.ac.jp  DNSSEC  BOGUS
 1.1.1.1  oscar.ac.jp  DNSSEC  BOGUS
+
+# --- 実効CAAの探索中の問い合わせ失敗 ---
+# 対象FQDNは解決できるが、上位ドメイン(papa.ac.jp)の問い合わせに失敗する → 探索を打ち切り、不可
+*  www.papa.ac.jp  A  192.0.2.25
+*  papa.ac.jp  STATUS  SERVFAIL
 
 # --- CAAのパラメータ (RFC 8657、BR 4.2.2.1.2) ---
 # 施行日(2027-03-15)以降は判定に反映し、それより前は【注意】だけを表示する

@@ -156,6 +156,26 @@ assert_eq "問題なし + 条件付き" "2" "$(worse_state 1 2)"
 assert_eq "条件付き + 発行できない" "0" "$(worse_state 2 0)"
 assert_eq "問題なし + 問題なし" "1" "$(worse_state 1 1)"
 
+echo "■ dig_cached"
+# 本物の dig の代わりに、呼ばれた回数を数える関数を使う
+dig() {
+    echo x >> "$WORK_DIR/dig_calls"
+    echo "answer for $*"
+    return 9
+}
+DIG_CACHE_DIR="$WORK_DIR/dig_cache"
+mkdir -p "$DIG_CACHE_DIR"
+first=$(dig_cached CAA www.alpha.ac.jp @8.8.8.8 +short)
+second=$(dig_cached +short @8.8.8.8 www.alpha.ac.jp CAA)
+dig_cached CAA www.alpha.ac.jp @8.8.8.8 +short > /dev/null
+rc=$?
+dig_cached CAA www.alpha.ac.jp @1.1.1.1 +short > /dev/null
+assert_eq "引数の順序が違っても同じ結果を返す" "$first" "$second"
+assert_eq "終了コードも使い回す" "9" "$rc"
+assert_eq "同じ問い合わせは1回だけ実行する" "2" "$(wc -l < "$WORK_DIR/dig_calls" | tr -d ' ')"
+unset -f dig
+DIG_CACHE_DIR=""
+
 echo "■ find_relevant_caa"
 assert_eq "親ドメインのCAA" 'alpha.ac.jp|0 issue "secomtrust.net"' "$(find_relevant_caa ok.alpha.ac.jp "")"
 assert_eq "自身のCAAが優先" 'own.bravo.ac.jp|0 issue "secomtrust.net"' "$(find_relevant_caa own.bravo.ac.jp "")"
@@ -163,6 +183,8 @@ assert_eq "CNAME先の親ではなく元のドメインの親へ遡る" 'delta.a
 assert_eq "CNAME先自身のCAA" 'www.foxtrot.ac.jp(CNAME先: foxtrot-host.net)|0 issue "letsencrypt.org"' "$(find_relevant_caa www.foxtrot.ac.jp "")"
 assert_eq "CAAがどこにもない" '|' "$(find_relevant_caa plain.hotel.ac.jp "")"
 assert_eq "DNS拠点ごとに異なるCAA" 'split.alpha.ac.jp|0 issue "letsencrypt.org"' "$(find_relevant_caa split.alpha.ac.jp 1.1.1.1)"
+assert_eq "上位ドメインのSERVFAILで探索を打ち切る" '!papa.ac.jp|SERVFAIL' "$(find_relevant_caa www.papa.ac.jp "")"
+assert_eq "タイムアウトで探索を打ち切る" '!slow.alpha.ac.jp|TIMEOUT_OR_ERROR' "$(find_relevant_caa slow.alpha.ac.jp 1.1.1.1)"
 
 echo "■ collect_auth_info"
 collect_auth_info ok.alpha.ac.jp
@@ -180,6 +202,15 @@ assert_eq "応答しない・拒否するサーバー" "NOERROR TIMEOUT_OR_ERROR
 assert_eq "IPv4アドレスのないNS" "ns6.mike-dns.net" "${AUTH_NO_V4[*]}"
 collect_auth_info plain.hotel.ac.jp
 assert_eq "NSが見つからない" "" "$AUTH_ZONE"
+collect_auth_info www.quebec.co.jp
+assert_eq "親ゾーンの委任情報からゾーンを特定" "quebec.co.jp" "$AUTH_ZONE"
+assert_eq "委任情報を取得した親ゾーン" "co.jp" "$AUTH_SOURCE"
+assert_eq "グルーのアドレスで問い合わせる" "ns1.quebec.co.jp (192.0.2.101)|ns2.quebec.co.jp (192.0.2.102)" "$(IFS='|'; echo "${AUTH_SERVERS[*]}")"
+assert_eq "親ゾーンのサーバーは応答" "1" "$AUTH_PARENT_REACHED"
+if auth_all_unresponsive; then pass "どの権威DNSサーバーも応答しない"; else fail "どの権威DNSサーバーも応答しない"; fi
+collect_auth_info www.mike.ac.jp
+if auth_all_unresponsive; then fail "一部が応答すれば全滅としない"; else pass "一部が応答すれば全滅としない"; fi
+assert_eq "応答があれば親ゾーンに問い合わせない" "" "$AUTH_PARENT_REACHED"
 
 echo "■ parse_tsv"
 # UPKIの申請TSVと同じ Shift-JIS / CR+LF / 13列のファイルを作る
@@ -272,6 +303,19 @@ assert_contains "詳細表示の節" "権威DNSサーバーでの確認 (再帰�
 assert_contains "詳細表示のサーバーごとの応答" "--- ns1.mike-dns.net (192.0.2.81) ---" "$RUN_OUTPUT"
 run_script -q www.november.ac.jp
 assert_contains "どの権威DNSサーバーにも問い合わせできない" "← 注意: 権威DNSサーバーのどれにも直接問い合わせできませんでした" "$RUN_OUTPUT"
+assert_judgement www.quebec.co.jp "❌" "❌"
+run_script -q www.quebec.co.jp
+assert_contains "まとめにパブリックDNSでの失敗と表示" "← パブリックDNS (8.8.8.8 または 1.1.1.1) で名前解決に失敗しました" "$RUN_OUTPUT"
+assert_not_contains "どれにも問い合わせできない注意を重ねて出さない" "直接問い合わせできませんでした" "$RUN_OUTPUT"
+run_script www.quebec.co.jp
+assert_contains "権威DNSサーバーの全滅を原因と推測" "[原因推測] ゾーン (quebec.co.jp) の権威DNSサーバーがどれも応答しません (ns1.quebec.co.jp (192.0.2.101), ns2.quebec.co.jp (192.0.2.102))" "$RUN_OUTPUT"
+assert_contains "この端末の通信の制限ではない" "この端末の通信の制限ではありません" "$RUN_OUTPUT"
+assert_not_contains "GeoIPと推測しない" "GeoIPブロッキング）が行われている可能性が高いです" "$RUN_OUTPUT"
+assert_not_contains "+cd での確認をしない" "DNSSECの検証失敗ではありませんでした" "$RUN_OUTPUT"
+assert_contains "委任情報から特定したことを表示" "親ゾーン (co.jp) の権威DNSサーバーに登録された委任情報から特定しました" "$RUN_OUTPUT"
+assert_judgement www.romeo.co.jp "✅" "✅"
+run_script -q www.romeo.co.jp
+assert_contains "キャッシュで応答している可能性の注意" "← 注意: 権威DNSサーバーがどれも応答しませんでした。(ゾーン: romeo.co.jp)" "$RUN_OUTPUT"
 run_script -q plain.hotel.ac.jp
 assert_contains "NSを特定できない" "← 注意: 権威DNSサーバー(NSレコード)を特定できなかった" "$RUN_OUTPUT"
 run_script -q ok.alpha.ac.jp
@@ -293,9 +337,17 @@ assert_contains "署名ありと表示" "DNSSEC: 署名あり" "$RUN_OUTPUT"
 run_script geo.alpha.ac.jp
 assert_contains "DNSSEC以外のSERVFAILはGeoIPと推測" "GeoIPブロッキング" "$RUN_OUTPUT"
 assert_contains "+cd でも確認したことを示す" "DNSSECの検証失敗ではありませんでした" "$RUN_OUTPUT"
+assert_not_contains "名前解決の失敗をCAAの問い合わせ失敗として重ねて指摘しない" "CAAレコードの問い合わせに失敗しました" "$RUN_OUTPUT"
 assert_not_contains "DNSSEC以外のSERVFAILでは検証失敗と表示しない" "DNSSECの検証失敗が原因です" "$RUN_OUTPUT"
 run_script www.bravo.ac.jp
 assert_contains "署名なしと表示" "DNSSEC: 署名なし" "$RUN_OUTPUT"
+
+echo "■ 実効CAAの探索中の問い合わせ失敗"
+assert_judgement www.papa.ac.jp "❌" "❌"
+run_script -q www.papa.ac.jp
+assert_contains "まとめに問い合わせ失敗と表示" "← 実効CAAレコードの探索中に、CAAレコードの問い合わせに失敗しました (デフォルトDNS: papa.ac.jp=SERVFAIL, 8.8.8.8: papa.ac.jp=SERVFAIL, 1.1.1.1: papa.ac.jp=SERVFAIL)" "$RUN_OUTPUT"
+run_script www.papa.ac.jp
+assert_contains "BR 3.2.2.8 への言及" "CAAの確認に失敗すると、CAは原則として発行できません(BR 3.2.2.8)" "$RUN_OUTPUT"
 
 echo "■ CAAのパラメータ (施行日 2027-03-15 より前)"
 export CHECK_MPIC_TODAY="2027-03-14"
